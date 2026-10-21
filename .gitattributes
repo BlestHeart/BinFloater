@@ -1,0 +1,11 @@
+# 统一用 LF 存进仓库，检出时也保持 LF
+* text=auto eol=lf
+# Windows 批处理必须是 CRLF，否则 cmd 解析会出问题
+*.bat text eol=crlf
+# 二进制文件不做行尾转换
+*.png binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.zip binary
+*.pyc binary
