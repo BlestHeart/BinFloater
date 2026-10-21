@@ -165,4 +165,4 @@ AI 工具：[DeepSeek Harness](https://github.com/deepseek-ai)（DeepSeek-V4 系
 
 ## 相关
 
-- **安卓版 BinIME**（带拼音引擎的输入法，二进制是其中一个面板）：同一套编解码思路的手机端实现，独立仓库
+- **[BinIME](https://github.com/BlestHeart/BinIME)** —— 安卓版：带 54.8 万条离线词库的拼音输入法，二进制是其中一个输入面板（独立仓库）
