@@ -14,7 +14,9 @@ import tkinter.font as tkfont
 
 import clipwin
 import core
+import hotkey as hotkey_mod
 import keys
+import tray
 import trigger
 
 APP_NAME = "BinFloater"
@@ -138,6 +140,22 @@ class BinFloater:
         self.dir_mode = self.cfg.get("dir_mode", DIR_AUTO)
         if self.dir_mode not in DIR_ORDER:
             self.dir_mode = DIR_AUTO
+        # 自定义快捷键。解析失败就静默退回默认值——配置文件被人手改坏
+        # 不该让整个程序起不来。
+        self.hotkey_spec = self.cfg.get("hotkey", hotkey_mod.DEFAULT_HOTKEY)
+        self.hotkey = hotkey_mod.load(self.hotkey_spec)
+        self.hotkey_spec = self.hotkey.spec()
+        self._capturing = False
+        self._capture_backup = None
+        # 连按几下空格触发。玩游戏的人容易被空格误触，调大一点更安全。
+        self.space_count = trigger.clamp_space_count(
+            self.cfg.get("space_count", trigger.SPACE_COUNT_DEFAULT)
+        )
+        # 托盘图标 + 最小化状态
+        self._tray = None
+        self._tray_events = queue.Queue()
+        self._in_tray = False
+        self._tray_hint_shown = bool(self.cfg.get("tray_hint_shown", False))
         # 钩子回调在系统线程里跑，绝对不能直接碰 tkinter（会崩）。
         # 回调只往队列里塞一个事件，主线程用 after 轮询取。
         self._triggers = queue.Queue()
@@ -154,7 +172,9 @@ class BinFloater:
         self.root.after(30, self._apply_round)
         self.root.after(200, self._poll)
         self.root.after(120, self._drain_triggers)
+        self.root.after(120, self._drain_tray_events)
         self._apply_trigger_mode(silent=True)
+        self._start_tray()
         self._set_status("正在监视剪切板…", TEAL)
 
     # ---------- 窗口 ----------
@@ -255,6 +275,7 @@ class BinFloater:
         self._hbtn(head, "✕", self._quit, hover=ERR)
         self._hbtn(head, "◐", self._cycle_alpha)
         self._hbtn(head, "▲", self._toggle_collapse, keep="collapse")
+        self._hbtn(head, "—", self._minimize_to_tray, hover=TEAL)
         self.pin_btn = self._hbtn(head, "◉", self._toggle_topmost)
 
     def _hbtn(self, parent, text, cmd, hover=ACCENT, keep=None):
@@ -374,7 +395,7 @@ class BinFloater:
         self.trigger_btn.pack(side="right")
         self.trigger_btn.bind("<Button-1>", lambda e: self._cycle_trigger_mode())
         self.trigger_btn.bind("<Enter>", lambda e: self.trigger_btn.configure(fg=ACCENT))
-        self.trigger_btn.bind("<Leave>", lambda e: self.trigger_btn.configure(fg=MUTED))
+        self.trigger_btn.bind("<Leave>", lambda e: self._paint_trigger_btn())
         self._paint_trigger_btn()
 
         desc = tk.Label(card, text="把光标所在行（行首到光标）转好后原地粘回，任何程序都能用",
@@ -383,15 +404,58 @@ class BinFloater:
         desc.pack(fill="x", padx=12)
 
         rows = tk.Frame(card, bg=CARD)
-        rows.pack(fill="x", padx=12, pady=(8, 10))
+        rows.pack(fill="x", padx=12, pady=(8, 4))
         self._btn(rows, "转换这一行", self._convert_line_now, primary=True).pack(side="left")
         self.dir_btn = tk.Label(rows, text="", bg=CARD, fg=MUTED,
                                 font=self.font_meta, padx=6, cursor="hand2")
         self.dir_btn.pack(side="right")
         self.dir_btn.bind("<Button-1>", lambda e: self._cycle_dir_mode())
         self.dir_btn.bind("<Enter>", lambda e: self.dir_btn.configure(fg=ACCENT))
-        self.dir_btn.bind("<Leave>", lambda e: self.dir_btn.configure(fg=MUTED))
+        self.dir_btn.bind("<Leave>", lambda e: self._paint_dir_btn())
         self._paint_dir_btn()
+
+        # 快捷键行。单独一行放，因为录制时这里要变成提示文字，
+        # 挤在按钮行里会把「转换这一行」挤变形。
+        keyrow = tk.Frame(card, bg=CARD)
+        keyrow.pack(fill="x", padx=12, pady=(0, 10))
+        tk.Label(keyrow, text="快捷键", bg=CARD, fg=MUTED,
+                 font=self.font_meta).pack(side="left")
+        self.hotkey_btn = tk.Label(keyrow, text="", bg=CARD_HI, fg=TEAL,
+                                   font=self.font_meta, padx=8, pady=2,
+                                   cursor="hand2")
+        self.hotkey_btn.pack(side="left", padx=(8, 0))
+        self.hotkey_btn.bind("<Button-1>", lambda e: self._start_capture())
+        self.hotkey_btn.bind("<Enter>",
+                             lambda e: self.hotkey_btn.configure(bg=STROKE)
+                             if not self._capturing else None)
+        self.hotkey_btn.bind("<Leave>",
+                             lambda e: self.hotkey_btn.configure(bg=CARD_HI)
+                             if not self._capturing else None)
+        self.hotkey_hint = tk.Label(keyrow, text="", bg=CARD, fg=MUTED,
+                                    font=self.font_meta)
+        self.hotkey_hint.pack(side="right")
+        self._paint_hotkey_btn()
+
+        # 连按次数。只在「双击空格」模式下有意义，切到快捷键模式时整行变灰，
+        # 免得用户以为调了没用（其实是不生效）。
+        spacerow = tk.Frame(card, bg=CARD)
+        spacerow.pack(fill="x", padx=12, pady=(0, 10))
+        self.space_lbl = tk.Label(spacerow, text="连按空格", bg=CARD, fg=MUTED,
+                                  font=self.font_meta)
+        self.space_lbl.pack(side="left")
+        self.space_btn = tk.Label(spacerow, text="", bg=CARD_HI, fg=TEAL,
+                                  font=self.font_meta, padx=8, pady=2,
+                                  cursor="hand2")
+        self.space_btn.pack(side="left", padx=(8, 0))
+        self.space_btn.bind("<Button-1>", lambda e: self._cycle_space_count())
+        self.space_btn.bind("<Enter>",
+                            lambda e: self.space_btn.configure(bg=STROKE))
+        self.space_btn.bind("<Leave>",
+                            lambda e: self.space_btn.configure(bg=CARD_HI))
+        self.space_hint = tk.Label(spacerow, text="", bg=CARD, fg=MUTED,
+                                   font=self.font_meta)
+        self.space_hint.pack(side="right")
+        self._paint_space_btn()
 
     def _btn(self, parent, text, cmd, primary=False):
         bg = "#2b3a5e" if primary else CARD_HI
@@ -502,6 +566,7 @@ class BinFloater:
         save_config(self.cfg)
         self._paint_trigger_btn()
         self._apply_trigger_mode()
+        self._paint_space_btn()
 
     def _apply_trigger_mode(self, silent=False):
         """按当前模式装/卸键盘钩子。"""
@@ -510,7 +575,9 @@ class BinFloater:
         if space or hotkey:
             if self._watcher is None:
                 self._watcher = trigger.KeyboardWatcher(
-                    self._on_hotkey_trigger, space_mode=space, hotkey_mode=hotkey
+                    self._on_hotkey_trigger, space_mode=space, hotkey_mode=hotkey,
+                    hotkey=self.hotkey, on_capture=self._on_hotkey_captured,
+                    space_count=self.space_count,
                 )
                 if not self._watcher.install():
                     self._watcher = None
@@ -520,20 +587,132 @@ class BinFloater:
             else:
                 self._watcher.space_mode = space
                 self._watcher.hotkey_mode = hotkey
+                self._watcher.hotkey = self.hotkey
+                self._watcher.space_count = self.space_count
         else:
             self._release_watcher()
         if not silent:
             if self.trigger_mode == TRIGGER_OFF:
                 self._set_status("已关闭快捷键触发", MUTED)
             elif self.trigger_mode == TRIGGER_SPACE:
-                self._set_status("连按两次空格触发（不按 Ctrl+Alt+B）", TEAL)
+                self._set_status("连按 %d 下空格触发（不按 %s）"
+                                 % (self.space_count, self.hotkey.text()), TEAL)
             else:
-                self._set_status("按 Ctrl+Alt+B 触发转换当前行", TEAL)
+                self._set_status("按 %s 触发转换当前行" % self.hotkey.text(), TEAL)
 
     def _release_watcher(self):
         if self._watcher is not None:
             self._watcher.uninstall()
             self._watcher = None
+
+    # ---------- 连按次数 ----------
+    def _paint_space_btn(self):
+        active = self.trigger_mode == TRIGGER_SPACE
+        self.space_btn.configure(
+            text="%d 下" % self.space_count,
+            fg=TEAL if active else "#5b6579",
+        )
+        self.space_lbl.configure(fg=MUTED if active else "#5b6579")
+        if not active:
+            self.space_hint.configure(text="仅双击空格模式", fg="#5b6579")
+        elif self.space_count <= 2:
+            self.space_hint.configure(text="容易误触就调大", fg=MUTED)
+        else:
+            self.space_hint.configure(text="更不容易误触", fg=MUTED)
+
+    def _cycle_space_count(self):
+        if self.trigger_mode != TRIGGER_SPACE:
+            self._set_status("先点右上角把触发方式切成「双击空格」", WARN, 5000)
+            return
+        n = self.space_count + 1
+        if n > trigger.SPACE_COUNT_MAX:
+            n = trigger.SPACE_COUNT_MIN
+        self.space_count = n
+        self.cfg["space_count"] = n
+        save_config(self.cfg)
+        if self._watcher is not None:
+            self._watcher.space_count = n
+        self._paint_space_btn()
+        self._set_status("连按 %d 下空格触发" % n, TEAL)
+
+    # ---------- 自定义快捷键 ----------
+    def _paint_hotkey_btn(self):
+        if self._capturing:
+            self.hotkey_btn.configure(text="按下新的组合键…", fg=WARN, bg=CARD_HI)
+            self.hotkey_hint.configure(text="Esc 取消")
+            return
+        self.hotkey_btn.configure(text=self.hotkey.text(), fg=TEAL, bg=CARD_HI)
+        if not self.hotkey.has_modifier():
+            self.hotkey_hint.configure(text="建议加修饰键", fg=WARN)
+        else:
+            self.hotkey_hint.configure(text="点一下改", fg=MUTED)
+
+    def _start_capture(self):
+        """进入录制状态：钩子开始把按键组合报回来。"""
+        if self._capturing:
+            self._stop_capture()
+            return
+        if self.trigger_mode == TRIGGER_OFF:
+            self._set_status("先点右上角把触发方式切成「快捷键」", WARN, 5000)
+            return
+        if self._watcher is None:
+            self._set_status("键盘钩子没装上，改不了快捷键", WARN, 5000)
+            return
+        # 记下原值：录制失败或被取消时要还原，不能让用户白点一场。
+        self._capture_backup = self.hotkey_spec
+        self._capturing = True
+        self._watcher.capture_mode = True
+        self._paint_hotkey_btn()
+        self._set_status("按下想用的组合键，Esc 取消", TEAL, 0)
+
+    def _stop_capture(self):
+        self._capturing = False
+        self._capture_backup = None
+        if self._watcher is not None:
+            self._watcher.capture_mode = False
+        self._paint_hotkey_btn()
+        self._idle_status()
+
+    def _on_hotkey_captured(self, spec):
+        """在钩子线程里被调用 —— 只能入队，交给主线程处理。"""
+        try:
+            self._triggers.put_nowait(("capture", spec))
+        except Exception:
+            pass
+
+    def _apply_captured(self, spec):
+        self._capturing = False
+        if self._watcher is not None:
+            self._watcher.capture_mode = False
+
+        if not spec:
+            self.hotkey_spec = self._capture_backup or hotkey_mod.DEFAULT_HOTKEY
+            self.hotkey = hotkey_mod.load(self.hotkey_spec)
+            self._capture_backup = None
+            self._paint_hotkey_btn()
+            self._set_status("已取消，快捷键没变", MUTED)
+            return
+
+        parsed = hotkey_mod.parse(spec)
+        if parsed is None:
+            self._paint_hotkey_btn()
+            self._set_status("这个键不支持，换一个", WARN, 5000)
+            return
+
+        self.hotkey = parsed
+        self.hotkey_spec = parsed.spec()
+        self.cfg["hotkey"] = self.hotkey_spec
+        save_config(self.cfg)
+        self._capture_backup = None
+        if self._watcher is not None:
+            self._watcher.hotkey = parsed
+        self._paint_hotkey_btn()
+        self._refresh_tray_tooltip()
+        if parsed.has_modifier():
+            self._set_status("快捷键已改为 %s" % parsed.text(), OK, 5000)
+        else:
+            self._set_status("%s —— %s" % (parsed.text(), hotkey_mod.WARN_NO_MODIFIER),
+                             WARN, 7000)
 
     def _on_hotkey_trigger(self, kind):
         """在系统钩子线程里被调用 —— 这里只能入队，不能碰 tkinter。"""
@@ -547,8 +726,13 @@ class BinFloater:
             return
         try:
             while True:
-                kind = self._triggers.get_nowait()
-                self._do_convert_line(kind)
+                item = self._triggers.get_nowait()
+                # 队列里混着两种事件：转换触发（字符串）和快捷键录制结果（元组）。
+                # 用类型区分，免得以后再加事件类型时又得改一轮。
+                if isinstance(item, tuple) and item and item[0] == "capture":
+                    self._apply_captured(item[1])
+                else:
+                    self._do_convert_line(item)
         except queue.Empty:
             pass
         except Exception:
@@ -579,7 +763,8 @@ class BinFloater:
             if left > 0:
                 self.root.after(60, lambda: attempt(left - 1))
             else:
-                self._set_status("切不回刚才的窗口，请用 Ctrl+Alt+B 触发", WARN, 6000)
+                self._set_status("切不回刚才的窗口，请用 %s 触发"
+                                 % self.hotkey.text(), WARN, 6000)
 
         attempt(2)
 
@@ -644,6 +829,7 @@ class BinFloater:
     def _quit(self):
         self._alive = False
         self._release_watcher()
+        self._stop_tray()
         try:
             self.cfg["x"] = self.root.winfo_x()
             self.cfg["y"] = self.root.winfo_y()
@@ -651,6 +837,120 @@ class BinFloater:
             self.root.destroy()
         except Exception:
             pass
+
+    # ---------- 托盘 ----------
+    def _start_tray(self):
+        """建托盘图标。失败不影响主功能，只是没有托盘。"""
+        try:
+            self._tray = tray.TrayIcon(
+                self._on_tray_event,
+                tooltip="二进制悬浮窗 · 快捷键 %s" % self.hotkey.text(),
+            )
+            self._tray.start()
+        except Exception:
+            self._tray = None
+
+    def _stop_tray(self):
+        if self._tray is not None:
+            try:
+                self._tray.stop()
+            except Exception:
+                pass
+            self._tray = None
+
+    def _on_tray_event(self, kind):
+        """托盘线程回调 —— 只入队，绝不碰 tkinter。"""
+        try:
+            self._tray_events.put_nowait(kind)
+        except Exception:
+            pass
+
+    def _drain_tray_events(self):
+        if not self._alive:
+            return
+        try:
+            while True:
+                kind = self._tray_events.get_nowait()
+                if kind == "show":
+                    self._show_from_tray()
+                elif kind == "quit":
+                    self._quit()
+                    return
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
+        try:
+            self.root.after(120, self._drain_tray_events)
+        except Exception:
+            pass
+
+    def _minimize_to_tray(self):
+        """最小化：窗口藏起来，托盘常驻，键盘钩子不动。
+
+        关键点：只是 withdraw 窗口，**不卸钩子**。用户要的就是「看不见它
+        但快捷键还能用」。
+        """
+        if self._tray is None or not self._tray.running:
+            # 没有托盘就退化成收成一条标题栏，至少不占屏幕
+            if not self._collapsed:
+                self._toggle_collapse()
+            self._set_status("托盘没起来，先收成一条", WARN, 5000)
+            return
+        self._in_tray = True
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
+        # 只弹一次：每次最小化都弹会烦人。用户可在设置里清掉这个标记。
+        if not self._tray_hint_shown:
+            self._tray_hint_shown = True
+            self.cfg["tray_hint_shown"] = True
+            save_config(self.cfg)
+            self._notify_tray(
+                "已收进托盘",
+                "悬浮窗收到托盘了，%s 依然可用。" % self.hotkey.text(),
+            )
+
+    def _notify_tray(self, title, text, warning=False):
+        if self._tray is None:
+            return False
+        try:
+            return self._tray.notify(title, text, warning)
+        except Exception:
+            return False
+
+    def _refresh_tray_tooltip(self):
+        """托盘提示里的快捷键要跟着用户设置走。"""
+        if self._tray is None:
+            return
+        try:
+            self._tray.tooltip = ("二进制悬浮窗 · 快捷键 %s"
+                                  % self.hotkey.text())[:127]
+        except Exception:
+            pass
+
+    def _show_from_tray(self):
+        if not self._in_tray:
+            self._bring_to_front()
+            return
+        self._in_tray = False
+        try:
+            self.root.deiconify()
+        except Exception:
+            pass
+        self._bring_to_front()
+
+    def _bring_to_front(self):
+        try:
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            if not self.topmost:
+                self.root.attributes("-topmost", False)
+            self.root.after(60, self._apply_round)
+        except Exception:
+            pass
+        self._set_status("已从托盘恢复", TEAL, 2500)
 
     # ---------- 状态提示 ----------
     def _set_status(self, text, color=MUTED, reset_after=4000):

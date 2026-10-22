@@ -18,8 +18,10 @@ a = Analysis(
     ["main.py"],
     pathex=["."],
     binaries=[],
-    datas=[],
-    hiddenimports=["clipwin", "core", "gui", "keys", "trigger"],
+    # tray.py 用 ctypes 直接调 Shell_NotifyIconW，没有第三方依赖；
+    # icon.ico 作为 data 带上，托盘图标从 sys._MEIPASS 里读。
+    datas=[("icon.ico", ".")] if os.path.exists("icon.ico") else [],
+    hiddenimports=["clipwin", "core", "gui", "keys", "trigger", "tray", "hotkey"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

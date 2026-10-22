@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""全局键盘监听：双击空格 或 组合热键 触发「转换当前行」。
+"""全局键盘监听：双击空格 或 自定义组合热键 触发「转换当前行」。
 
 用 WH_KEYBOARD_LL 低级键盘钩子。选它的理由：
-  RegisterHotKey 只能注册单次组合键，做不了「连按两次空格」这种时序判断；
-  而且 RegisterHotKey 要在窗口过程里收 WM_HOTKEY，tkinter 不方便接管。
+  RegisterHotKey 只能注册固定的组合键，且要在窗口过程里收 WM_HOTKEY，
+  tkinter 不方便接管；更重要的是它做不了「连按两次空格」这种时序判断，
+  也没法在用户自定义快捷键时动态换绑。
 
 **钩子回调里绝对不能干重活**：Windows 有个 LowLevelHooksTimeout（默认 300ms），
 回调超时会被系统静默摘掉钩子，之后就再也不触发了，而且不报错。
@@ -13,6 +14,8 @@ import ctypes
 import os
 import time
 from ctypes import wintypes
+
+import hotkey as hk
 
 IS_WINDOWS = os.name == "nt"
 
@@ -25,6 +28,7 @@ WM_SYSKEYUP = 0x0105
 LLKHF_INJECTED = 0x10
 
 VK_SPACE = 0x20
+VK_ESCAPE = 0x1B
 VK_CONTROL = 0x11
 VK_MENU = 0x12  # Alt
 VK_B = 0x42
@@ -32,6 +36,23 @@ VK_B = 0x42
 # 两次空格的间隔上限。太长会误触（正常打字相邻两个空格很常见），
 # 太短用户按不出来。350ms 是试出来比较顺手的值。
 DOUBLE_SPACE_MS = 350
+
+# 连按次数的取值范围。1 下等于「按一下空格就触发」，正常打字根本没法用，
+# 但留着是因为有人可能配合别的开关用；上限 5 下，再多用户按不过来。
+SPACE_COUNT_MIN = 1
+SPACE_COUNT_MAX = 5
+SPACE_COUNT_DEFAULT = 2
+
+
+def clamp_space_count(n) -> int:
+    """把连按次数夹到合法区间。配置坏了不该让功能失效，静默回默认值。"""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return SPACE_COUNT_DEFAULT
+    if n < SPACE_COUNT_MIN or n > SPACE_COUNT_MAX:
+        return SPACE_COUNT_DEFAULT
+    return n
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -68,22 +89,34 @@ if IS_WINDOWS:
 
 
 class KeyboardWatcher:
-    """低级键盘钩子。检测到触发条件时调用 on_trigger()。
+    """低级键盘钩子。检测到触发条件时调用 on_trigger(kind)。
 
     on_trigger 会在钩子回调的上下文里被调用 —— 调用方必须保证它只做入队
     之类的轻量操作，不能在里面做剪切板读写或 SendInput。
+
+    hotkey        要监听的组合键（hotkey.Hotkey 实例），None 表示用默认值
+    on_capture    录制新快捷键时的回调，收到 hotkey spec 字符串；
+                  收到 "" 表示用户按 Esc 取消了录制
+    capture_mode  为 True 时进入录制状态：不触发转换，只把按键组合报出去
     """
 
-    def __init__(self, on_trigger, space_mode=True, hotkey_mode=True):
+    def __init__(self, on_trigger, space_mode=True, hotkey_mode=True,
+                 hotkey=None, on_capture=None, space_count=None):
         self.on_trigger = on_trigger
+        self.on_capture = on_capture
         # 两个开关独立：关掉的那个绝不能吞按键，否则用户会莫名其妙丢空格。
         self.space_mode = space_mode
         self.hotkey_mode = hotkey_mode
+        self.hotkey = hotkey if hotkey is not None else hk.load(hk.DEFAULT_HOTKEY)
+        self.capture_mode = False
+        # 连按几下空格才触发。默认 2 下；玩游戏的人容易被空格误触，
+        # 可以调到 3 下甚至 4 下——代价是正常打字时更不容易凑巧按到。
+        self.space_count = clamp_space_count(space_count)
         self._hook = None
         self._proc = None
         self._last_space = 0.0
-        # 空格连按模式下，第一下空格按下时记时间；第二下才算触发
-        self._pending_space = False
+        # 已经连按了几下空格。到 space_count 就触发。
+        self._space_streak = 0
 
     def install(self) -> bool:
         if not IS_WINDOWS or self._hook:
@@ -126,28 +159,65 @@ class KeyboardWatcher:
             pass
         return _user32.CallNextHookEx(self._hook, n_code, w_param, l_param)
 
+    def _current_mods(self):
+        """当前正被按住的修饰键集合。"""
+        return set(hk.describe_mods_from_state(self._down))
+
     def _on_key(self, vk: int) -> bool:
         """返回 True 表示这个按键要吞掉。"""
+        # 录制模式优先：这时所有按键都用来组成新快捷键，绝不触发转换
+        if self.capture_mode:
+            return self._on_key_capture(vk)
+
         now = time.time()
-        if vk == VK_SPACE:
-            if not self.space_mode:
-                return False
-            if self._pending_space and (now - self._last_space) * 1000 <= DOUBLE_SPACE_MS:
-                self._pending_space = False
+        if vk == VK_SPACE and self.space_mode:
+            fresh = (now - self._last_space) * 1000 <= DOUBLE_SPACE_MS
+            if self._space_streak and fresh:
+                self._space_streak += 1
+            else:
+                self._space_streak = 1
+            self._last_space = now
+            if self._space_streak >= self.space_count:
+                self._space_streak = 0
                 self._last_space = 0.0
                 self.on_trigger("space")
-                # 吞掉第二个空格：不然它会在我们发 Shift+Home 之前抢先插进去，
+                # 吞掉这一下空格：不然它会在我们发 Shift+Home 之前抢先插进去，
                 # 万一它比 Shift+Home 晚到，就会把选中的文字覆盖掉，整行报废。
                 return True
-            self._pending_space = True
-            self._last_space = now
             return False
 
         # 除了空格，其他按键都会打断「连按空格」的判定：
         # 用户打了字之后又按空格，不该和上一次的空格凑成一对。
-        self._pending_space = False
+        self._space_streak = 0
 
-        if self.hotkey_mode and vk == VK_B and self._down(VK_CONTROL) and self._down(VK_MENU):
-            self.on_trigger("hotkey")
-            return True
+        if self.hotkey_mode and self.hotkey is not None and vk == self.hotkey.vk:
+            # 修饰键必须完全一致：Ctrl+Alt+B 绑的键，按 Ctrl+Alt+Shift+B 不触发。
+            # 严格比较是为了可预期——否则用户永远不知道多按一个键算不算数。
+            if self._current_mods() == set(self.hotkey.mods):
+                self.on_trigger("hotkey")
+                return True
         return False
+
+    def _on_key_capture(self, vk: int) -> bool:
+        """录制模式下的按键处理。"""
+        if self.on_capture is None:
+            self.capture_mode = False
+            return False
+
+        mods = self._current_mods()
+
+        # 单独按 Esc = 取消。带修饰键的 Esc（Ctrl+Esc）仍然可以当快捷键用。
+        if vk == VK_ESCAPE and not mods:
+            self.on_capture("")
+            return True
+
+        # 修饰键本身不构成快捷键，等主键按下来
+        if vk in hk.MODIFIER_VKS:
+            return False
+
+        h = hk.make(mods, vk)
+        if h is None:
+            return False  # 不认识的键（小键盘、多媒体键等），忽略
+        self.on_capture(h.spec())
+        # 吞掉：不然这个键会落进用户正在编辑的程序里
+        return True

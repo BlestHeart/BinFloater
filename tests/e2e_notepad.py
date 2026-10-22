@@ -38,20 +38,60 @@ def check(name, cond, detail=""):
     print(("  PASS  " if cond else "  FAIL  ") + name + (("  " + str(detail)) if detail else ""))
 
 
-def type_text(s):
-    """用 SendInput 逐字符敲。中文没法直接敲，测试里只用 ASCII。"""
-    VK = {" ": 0x20, ".": 0xBE, "-": 0xBD, "_": 0xBD, "0": 0x30}
+class _GTI(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("flags", ctypes.c_ulong),
+        ("hwndActive", ctypes.c_void_p),
+        ("hwndFocus", ctypes.c_void_p),
+        ("hwndCapture", ctypes.c_void_p),
+        ("hwndMenuOwner", ctypes.c_void_p),
+        ("hwndMoveSize", ctypes.c_void_p),
+        ("hwndCaret", ctypes.c_void_p),
+        ("rcCaret", ctypes.c_long * 4),
+    ]
+
+
+user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+user32.GetWindowThreadProcessId.restype = ctypes.c_ulong
+user32.GetGUIThreadInfo.argtypes = [ctypes.c_ulong, ctypes.POINTER(_GTI)]
+user32.GetGUIThreadInfo.restype = ctypes.c_bool
+user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
+user32.PostMessageW.restype = ctypes.c_bool
+WM_CHAR = 0x0102
+
+
+def edit_control(hwnd):
+    """拿到记事本窗口里真正接收文字的 EDIT 子控件。
+
+    直接往顶层窗口发消息没用——文字是进子控件的。用 GetGUIThreadInfo 问系统
+    「这个窗口线程现在的焦点在谁身上」，比 EnumChildWindows 猜类名可靠。
+    """
+    tid = user32.GetWindowThreadProcessId(hwnd, None)
+    gi = _GTI()
+    gi.cbSize = ctypes.sizeof(_GTI)
+    if not user32.GetGUIThreadInfo(tid, ctypes.byref(gi)):
+        return None
+    return gi.hwndFocus
+
+
+def type_text(s, hwnd=None):
+    """往编辑控件里塞文字。
+
+    这里刻意不用 SendInput 敲字母键：这台机器的输入法键盘布局是 0x0804（中文），
+    字母键会先进输入法的组合状态，被输入法吃掉，控件收不到字符——实测敲 'hi'
+    读回来是空字符串，排查了很久才发现是 IME 而不是 SendInput 本身的问题。
+    PostMessage WM_CHAR 直接投递到控件，绕开输入法，测试想验的是 convert_line
+    的键序列，不是打字功能。
+
+    产品本身不受影响：convert_line 只用 Shift+Home / Ctrl+C / Ctrl+V，
+    这些导航键和修饰键组合不经过 IME。
+    """
+    target = edit_control(hwnd) if hwnd else None
+    if not target:
+        raise RuntimeError("找不到记事本的编辑控件")
     for ch in s:
-        if ch.isalpha():
-            vk = ord(ch.upper())
-        elif ch.isdigit():
-            vk = ord(ch)
-        elif ch in VK:
-            vk = VK[ch]
-        else:
-            raise ValueError("测试不支持这个字符: %r" % ch)
-        shift = ch.isupper() or ch in "_.:?{}|~!@#$%^&*()+"
-        keys.tap(vk, (keys.VK_SHIFT,) if shift else ())
+        user32.PostMessageW(target, WM_CHAR, ord(ch), 0)
         time.sleep(0.012)
 
 
@@ -85,7 +125,7 @@ def prepare_editor(hwnd, text):
             time.sleep(0.2)
             continue
         time.sleep(0.12)
-        type_text(text)
+        type_text(text, hwnd)
         time.sleep(0.15)
         if read_editor() == text:
             # 取消全选，把光标放到行尾——这才是用户真正打字时的状态

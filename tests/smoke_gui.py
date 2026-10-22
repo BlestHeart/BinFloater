@@ -2,7 +2,14 @@
 """冒烟测试：真的把 GUI 建起来，检查控件和钩子是否就绪，然后退出。"""
 import os
 import sys
+import tempfile
 import tkinter as tk
+
+# 必须在 import gui 之前把 APPDATA 指到临时目录：gui.config_path() 读的就是它。
+# 否则这个测试会写真实配置——曾经把 tray_hint_shown 置成 true，
+# 结果用户永远看不到「已收进托盘」那条气泡通知。
+_TMP_APPDATA = tempfile.mkdtemp(prefix="binfloater_smoke_")
+os.environ["APPDATA"] = _TMP_APPDATA
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -70,12 +77,44 @@ app._on_hotkey_trigger("space")
 check("事件已入队", not app._triggers.empty())
 # 注意：不真的执行 _drain_triggers，否则会去动真实前台窗口
 
+print("=== 托盘 ===")
+check("托盘已启动", app._tray is not None and app._tray.running)
+check("默认不在托盘", app._in_tray is False)
+app._minimize_to_tray()
+root.update()
+check("最小化后进入托盘", app._in_tray is True)
+check("最小化后窗口隐藏", root.state() == "withdrawn", root.state())
+check("最小化后钩子仍在", app._watcher is not None)
+check("托盘提示只弹一次", app._tray_hint_shown is True)
+app._show_from_tray()
+root.update()
+check("从托盘恢复", app._in_tray is False)
+check("恢复后窗口可见", root.state() == "normal", root.state())
+
+print("=== 连按次数 ===")
+check("默认 2 下", app.space_count == 2, app.space_count)
+app._cycle_space_count()
+check("非空格模式不生效", app.space_count == 2, app.space_count)
+app.trigger_mode = "space"
+app._apply_trigger_mode(silent=True)
+app._cycle_space_count()
+check("切到 3 下", app.space_count == 3, app.space_count)
+check("同步给钩子", app._watcher.space_count == 3, app._watcher.space_count)
+check("持久化", app.cfg.get("space_count") == 3, app.cfg.get("space_count"))
+
 print("=== 窗口 ===")
 check("窗口有尺寸", root.winfo_width() > 300, root.winfo_width())
 check("窗口有高度", root.winfo_height() > 400, root.winfo_height())
 
 app._release_watcher()
 root.destroy()
+
+# 临时配置目录用完就删，别在系统临时区留垃圾
+try:
+    import shutil
+    shutil.rmtree(_TMP_APPDATA, ignore_errors=True)
+except Exception:
+    pass
 
 print()
 print("通过 %d 项，失败 %d 项" % (len(ok), len(bad)))
