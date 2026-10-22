@@ -25,16 +25,24 @@ W_HEIGHT = 468  # 兜底值，实际启动后按内容自适应
 COLLAPSED_H = 52
 PLACEHOLDER_RESULT = "复制一段 01001000 01101001 ……\n这里会自动翻译成 Hi"
 
-# 触发方式。默认快捷键：双击空格虽然顺手，但它在任何程序里都会吃掉两个空格，
+# 触发方式。默认快捷键：空格连按虽然顺手，但它在任何程序里都会吃掉那几个空格，
 # 对不想要这个功能的人来说代价太大，所以让用户自己开。
 TRIGGER_HOTKEY = "hotkey"
 TRIGGER_SPACE = "space"
 TRIGGER_OFF = "off"
 TRIGGER_ORDER = [TRIGGER_HOTKEY, TRIGGER_SPACE, TRIGGER_OFF]
+# 名字不能叫「双击空格」：连按次数 1~5 可调，写死「双击」是错的，
+# 用户把次数调到 3 之后，按钮上还写着「双击空格」，看着就不对。
 TRIGGER_TEXT = {
     TRIGGER_HOTKEY: "快捷键",
-    TRIGGER_SPACE: "双击空格",
+    TRIGGER_SPACE: "空格连按",
     TRIGGER_OFF: "关闭",
+}
+# 每种模式下「代价」是什么，写在切换按钮右边。用户切换前应该知道要付出什么。
+TRIGGER_HINT = {
+    TRIGGER_HOTKEY: "不占用空格",
+    TRIGGER_SPACE: "会吃掉这几个空格",
+    TRIGGER_OFF: "不占键盘钩子",
 }
 
 # 转换方向。auto 用 core.auto_detect 判断，跟剪切板卡片的行为一致。
@@ -390,13 +398,6 @@ class BinFloater:
         top.pack(fill="x", padx=12, pady=(10, 4))
         tk.Label(top, text="转换当前行", bg=CARD, fg=TEXT,
                  font=self.font_title).pack(side="left")
-        self.trigger_btn = tk.Label(top, text="", bg=CARD, fg=MUTED,
-                                    font=self.font_meta, padx=6, cursor="hand2")
-        self.trigger_btn.pack(side="right")
-        self.trigger_btn.bind("<Button-1>", lambda e: self._cycle_trigger_mode())
-        self.trigger_btn.bind("<Enter>", lambda e: self.trigger_btn.configure(fg=ACCENT))
-        self.trigger_btn.bind("<Leave>", lambda e: self._paint_trigger_btn())
-        self._paint_trigger_btn()
 
         desc = tk.Label(card, text="把光标所在行（行首到光标）转好后原地粘回，任何程序都能用",
                         bg=CARD, fg=MUTED, font=self.font_meta, anchor="w",
@@ -413,6 +414,28 @@ class BinFloater:
         self.dir_btn.bind("<Enter>", lambda e: self.dir_btn.configure(fg=ACCENT))
         self.dir_btn.bind("<Leave>", lambda e: self._paint_dir_btn())
         self._paint_dir_btn()
+
+        # 触发方式行。放在最前面并且单独成行：之前它挤在卡片标题右边，
+        # 只是一个没有边框的彩色小字，用户根本没意识到那里可以点、更不知道
+        # 点一下是在切换触发方式。现在给它自己的行 + 明确标签 + 按钮底框，
+        # 右边补一句「这么做要付出什么」，切换前就知道代价。
+        moderow = tk.Frame(card, bg=CARD)
+        moderow.pack(fill="x", padx=12, pady=(2, 6))
+        tk.Label(moderow, text="触发方式", bg=CARD, fg=MUTED,
+                 font=self.font_meta).pack(side="left")
+        self.trigger_btn = tk.Label(moderow, text="", bg=CARD_HI, fg=TEAL,
+                                    font=self.font_meta, padx=8, pady=2,
+                                    cursor="hand2")
+        self.trigger_btn.pack(side="left", padx=(8, 0))
+        self.trigger_btn.bind("<Button-1>", lambda e: self._cycle_trigger_mode())
+        self.trigger_btn.bind("<Enter>",
+                              lambda e: self.trigger_btn.configure(bg=STROKE))
+        self.trigger_btn.bind("<Leave>",
+                              lambda e: self.trigger_btn.configure(bg=CARD_HI))
+        self.trigger_hint = tk.Label(moderow, text="", bg=CARD, fg=MUTED,
+                                     font=self.font_meta)
+        self.trigger_hint.pack(side="right")
+        self._paint_trigger_btn()
 
         # 快捷键行。单独一行放，因为录制时这里要变成提示文字，
         # 挤在按钮行里会把「转换这一行」挤变形。
@@ -436,7 +459,7 @@ class BinFloater:
         self.hotkey_hint.pack(side="right")
         self._paint_hotkey_btn()
 
-        # 连按次数。只在「双击空格」模式下有意义，切到快捷键模式时整行变灰，
+        # 连按次数。只在「空格连按」模式下有意义，切到快捷键模式时整行变灰，
         # 免得用户以为调了没用（其实是不生效）。
         spacerow = tk.Frame(card, bg=CARD)
         spacerow.pack(fill="x", padx=12, pady=(0, 10))
@@ -558,6 +581,10 @@ class BinFloater:
             fg=MUTED if self.trigger_mode == TRIGGER_OFF else TEAL,
             text=TRIGGER_TEXT.get(self.trigger_mode, "快捷键"),
         )
+        self.trigger_hint.configure(
+            text=TRIGGER_HINT.get(self.trigger_mode, ""),
+            fg=MUTED if self.trigger_mode != TRIGGER_OFF else "#5b6579",
+        )
 
     def _cycle_trigger_mode(self):
         idx = TRIGGER_ORDER.index(self.trigger_mode)
@@ -620,7 +647,7 @@ class BinFloater:
         )
         self.space_lbl.configure(fg=MUTED if active else "#5b6579")
         if not active:
-            self.space_hint.configure(text="仅双击空格模式", fg="#5b6579")
+            self.space_hint.configure(text="仅空格连按模式", fg="#5b6579")
         elif self.space_count <= 2:
             self.space_hint.configure(text="容易误触就调大", fg=MUTED)
         else:
@@ -628,7 +655,7 @@ class BinFloater:
 
     def _cycle_space_count(self):
         if self.trigger_mode != TRIGGER_SPACE:
-            self._set_status("先点右上角把触发方式切成「双击空格」", WARN, 5000)
+            self._set_status("先把触发方式切成「空格连按」", WARN, 5000)
             return
         n = self.space_count + 1
         if n > trigger.SPACE_COUNT_MAX:
@@ -661,7 +688,7 @@ class BinFloater:
             self._stop_capture()
             return
         if self.trigger_mode == TRIGGER_OFF:
-            self._set_status("先点右上角把触发方式切成「快捷键」", WARN, 5000)
+            self._set_status("先把触发方式切成「快捷键」", WARN, 5000)
             return
         if self._watcher is None:
             self._set_status("键盘钩子没装上，改不了快捷键", WARN, 5000)
@@ -938,7 +965,7 @@ class BinFloater:
     def _trigger_text(self):
         """当前生效的触发方式的说法，给托盘提示和气泡通知用。
 
-        必须按 trigger_mode 现算，不能写死快捷键：用户在「双击空格」模式下
+        必须按 trigger_mode 现算，不能写死快捷键：用户在「空格连按」模式下
         收到的通知却写着「Ctrl+Alt+B 依然可用」，那是在骗人——空格模式下
         按快捷键根本不会触发。
         """

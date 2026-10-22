@@ -102,7 +102,7 @@ def _only(*vks):
 
 
 class TestTriggerLogic(unittest.TestCase):
-    """双击空格 / 快捷键的状态机。直接调 _on_key，不需要真的装钩子。"""
+    """空格连按 / 快捷键的状态机。直接调 _on_key，不需要真的装钩子。"""
 
     def setUp(self):
         self.fired = []

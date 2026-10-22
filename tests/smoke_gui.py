@@ -45,6 +45,15 @@ check("转换当前行卡片", hasattr(app, "trigger_btn"))
 check("方向按钮", hasattr(app, "dir_btn"))
 check("触发按钮文字", app.trigger_btn.cget("text") == "快捷键", app.trigger_btn.cget("text"))
 check("方向按钮文字", app.dir_btn.cget("text") == "自动判断", app.dir_btn.cget("text"))
+# 触发方式必须能被认出来是「可以点的地方」：有底框、有自己的标签行。
+# 以前它只是卡片标题右边一个没有边框的小字，用户根本没发现可以点。
+check("触发按钮有底框", app.trigger_btn.cget("bg") == gui.CARD_HI, app.trigger_btn.cget("bg"))
+check("触发按钮可点", "hand2" in str(app.trigger_btn.cget("cursor")), app.trigger_btn.cget("cursor"))
+check("触发方式提示", hasattr(app, "trigger_hint") and app.trigger_hint.cget("text") == "不占用空格",
+      app.trigger_hint.cget("text") if hasattr(app, "trigger_hint") else "缺失")
+# 名字不能叫「双击空格」：连按次数可调，调到 3 之后名字就是错的
+check("空格模式名字不带双击",
+      "双击" not in gui.TRIGGER_TEXT[gui.TRIGGER_SPACE], gui.TRIGGER_TEXT[gui.TRIGGER_SPACE])
 
 print("=== 钩子 ===")
 check("默认模式是快捷键", app.trigger_mode == gui.TRIGGER_HOTKEY, app.trigger_mode)
@@ -55,12 +64,15 @@ check("space_mode 关", app._watcher is not None and not app._watcher.space_mode
 print("=== 模式切换 ===")
 app._cycle_trigger_mode()  # hotkey -> space
 root.update()
-check("切到双击空格", app.trigger_mode == gui.TRIGGER_SPACE, app.trigger_mode)
+check("切到空格连按", app.trigger_mode == gui.TRIGGER_SPACE, app.trigger_mode)
+check("空格模式按钮文字", app.trigger_btn.cget("text") == "空格连按", app.trigger_btn.cget("text"))
+check("空格模式提示说代价", "空格" in app.trigger_hint.cget("text"), app.trigger_hint.cget("text"))
 check("space_mode 开", app._watcher is not None and app._watcher.space_mode)
 check("hotkey_mode 关", app._watcher is not None and not app._watcher.hotkey_mode)
 app._cycle_trigger_mode()  # space -> off
 root.update()
 check("切到关闭", app.trigger_mode == gui.TRIGGER_OFF, app.trigger_mode)
+check("关闭模式提示", app.trigger_hint.cget("text") == "不占键盘钩子", app.trigger_hint.cget("text"))
 check("关闭后钩子已卸", app._watcher is None)
 app._cycle_trigger_mode()  # off -> hotkey
 root.update()
