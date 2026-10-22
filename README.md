@@ -165,4 +165,4 @@ AI 工具：[DeepSeek Harness](https://github.com/deepseek-ai)（DeepSeek-V4 系
 
 ## 相关
 
-- **[BinIME](https://github.com/BlestHeart/BinIME)** —— 安卓版：带 54.8 万条离线词库的拼音输入法，二进制是其中一个输入面板（独立仓库）
+- **[BinFloater-Android](https://github.com/BlestHeart/BinFloater-Android)** —— 安卓版：同一套编解码核心的悬浮窗实现，点一下读剪切板（独立仓库）
