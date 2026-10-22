@@ -427,6 +427,87 @@ class TestStaticChecks(unittest.TestCase):
         # 必须校验调用后的真实前台，不能只看返回值
         self.assertIn("GetForegroundWindow() == hwnd", body)
 
+    def test_grab_line_uses_ctrl_shift_home(self):
+        # Shift+Home 只选到视觉行首。文字转成二进制后长度膨胀约 9 倍，
+        # 必然自动换行，Shift+Home 只抓到末尾一小截，反解必然是乱码——
+        # 「转过去再转回来」这条路会彻底失效。必须用 Ctrl+Shift+Home。
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        k = open(os.path.join(root, "keys.py"), encoding="utf-8").read()
+        idx = k.find("def grab_line")
+        self.assertGreater(idx, 0)
+        body = k[idx:k.find("\ndef ", idx + 10)]
+        self.assertIn("tap(VK_HOME, (VK_CONTROL, VK_SHIFT))", body)
+        self.assertNotIn("tap(VK_HOME, (VK_SHIFT,))", body)
+        # 复制完要按换行切出逻辑行，再把选区收到行首
+        self.assertIn('got.rfind("\\n")', body)
+        self.assertIn("tap_many(VK_RIGHT, (VK_SHIFT,), cut)", body)
+
+    def test_grab_line_retries_on_empty_copy(self):
+        # 选区要靠目标程序自己处理，程序正忙时 Ctrl+C 可能早于选区建立，
+        # 复制到空的。实测偶发率约五分之一，不重试就静默返回空行。
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        k = open(os.path.join(root, "keys.py"), encoding="utf-8").read()
+        idx = k.find("def grab_line")
+        body = k[idx:k.find("\ndef ", idx + 10)]
+        self.assertIn("attempts", body)
+        self.assertIn("for attempt in range", body)
+        self.assertIn("if got:", body)
+
+    def test_tap_many_batches_send_input(self):
+        # 往左收 350 个字符就是 350 次 SendInput 系统调用，太慢且容易丢；
+        # 必须一次发一整批。chunk 分批是为了不超 SendInput 的容量上限。
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        k = open(os.path.join(root, "keys.py"), encoding="utf-8").read()
+        idx = k.find("def tap_many")
+        self.assertGreater(idx, 0)
+        body = k[idx:k.find("\ndef ", idx + 10)]
+        self.assertIn("chunk", body)
+        self.assertIn("_send(seq)", body)
+        # 一组里修饰键要先按下、后松开
+        self.assertIn("reversed(mods)", body)
+
+    def test_tap_many_builds_expected_sequence(self):
+        # 真构造一批出来数一数：n 次 vk + m 个修饰键 = n*(1+m)*2 个事件
+        sent = []
+        orig = keys_mod._send
+        try:
+            keys_mod._send = lambda seq: (sent.append(list(seq)), True)[1]
+            keys_mod.tap_many(keys_mod.VK_RIGHT, (keys_mod.VK_SHIFT,), 5)
+        finally:
+            keys_mod._send = orig
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(len(sent[0]), 5 * (1 + 1) * 2)
+        # 每个动作都是 shift 下 → right 下 → right 上 → shift 上
+        self.assertEqual(sent[0][0].u.ki.wVk, keys_mod.VK_SHIFT)
+        self.assertEqual(sent[0][1].u.ki.wVk, keys_mod.VK_RIGHT)
+        self.assertEqual(sent[0][2].u.ki.wVk, keys_mod.VK_RIGHT)
+        self.assertTrue(sent[0][2].u.ki.dwFlags & keys_mod.KEYEVENTF_KEYUP)
+        self.assertEqual(sent[0][3].u.ki.wVk, keys_mod.VK_SHIFT)
+        self.assertTrue(sent[0][3].u.ki.dwFlags & keys_mod.KEYEVENTF_KEYUP)
+
+    def test_tap_many_splits_into_chunks(self):
+        # 超大批量要分批发，别一次塞给 SendInput
+        sent = []
+        orig = keys_mod._send
+        try:
+            keys_mod._send = lambda seq: (sent.append(len(seq)), True)[1]
+            keys_mod.tap_many(keys_mod.VK_RIGHT, (), 10, chunk=4)
+        finally:
+            keys_mod._send = orig
+        self.assertEqual(len(sent), 3)   # 4 + 4 + 2
+        self.assertEqual(sent, [8, 8, 4])
+
+    def test_tap_many_zero_is_noop(self):
+        sent = []
+        orig = keys_mod._send
+        try:
+            keys_mod._send = lambda seq: (sent.append(len(seq)), True)[1]
+            self.assertTrue(keys_mod.tap_many(keys_mod.VK_RIGHT, (), 0))
+        finally:
+            keys_mod._send = orig
+        self.assertEqual(sent, [])
+
+
 
     def test_capture_callback_only_enqueues(self):
         # 录制回调同样跑在钩子线程里，绝不能直接改 tkinter 控件。

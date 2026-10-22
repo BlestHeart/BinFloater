@@ -87,14 +87,23 @@ dist\BinFloater\BinFloater.exe
 文字→二进制、二进制→文字。
 
 实现方式不走 UI Automation（Windows 没有通用的「读取别的程序输入框」接口，
-各家实现差异极大），而是模拟 `Shift+Home` 选中 → `Ctrl+C` 复制 → 转换 →
-`Ctrl+V` 粘回。凡是能编辑的地方都支持，包括微信、浏览器、IDE、游戏聊天框。
+各家实现差异极大），而是模拟选中 → `Ctrl+C` 复制 → 转换 → `Ctrl+V` 粘回。
+凡是能编辑的地方都支持，包括微信、浏览器、IDE、游戏聊天框。
 
 剪切板在转换完会还原成你原来的内容，不会被占掉。
 
 > 导航键（Home/End/方向键/Delete）必须以**扩展键**形式发送，否则系统会当成
-> 小键盘上的同名键，`Shift+Home` 就退化成单纯把光标移到行首——什么都不选中，
+> 小键盘上的同名键，选区操作就退化成单纯移动光标——什么都不选中，
 > 转换静默失败。这个坑在 `Shift+A` 上测不出来，只有导航键才会踩。
+
+> 选行用的是 `Ctrl+Shift+Home` 再按换行切出逻辑行，**不是** `Shift+Home`。
+> 后者只选到**视觉行首**：文字转成二进制后长度膨胀约 9 倍（UTF-8 每字节 8 位、
+> 再加分隔空格），随便一句中文都会自动换行，于是只抓到末尾那一小截，反解出来
+> 必然是乱码——「转过去再转回来」这条路会彻底失效。改用 `Ctrl+Shift+Home`
+> 选到文档开头再切最后一行，之后把选区用 `Shift+Right` 收回行首。
+>
+> 收回选区是**一次 SendInput 发一整批**（`tap_many`）。逐个发的话，往左收 350
+> 个字符就是 350 次系统调用，慢且中途被抢走输入就会丢。
 
 > 点面板上的「转换这一行」按钮时，前台是悬浮窗自己，得先把焦点还给用户刚才
 > 用的窗口。Windows 有**前台锁定**：不在前台的进程调 `SetForegroundWindow`
@@ -192,7 +201,7 @@ binfloater/
 ├── tray.py            系统托盘（ctypes 自绘，含气泡通知）
 ├── build_onedir.spec  PyInstaller 打包配置（文件夹模式）
 ├── make_icon.py       生成图标
-├── tests/             回归测试
+├── tests/             回归测试（含 e2e_roundtrip 往返测试）
 └── dist/
     └── BinFloater/    文件夹版（双击 BinFloater.exe）
 ```
@@ -200,10 +209,11 @@ binfloater/
 ## 测试
 
 ```bash
-python tests/test_all.py       # 69 项：编解码 + 触发逻辑 + 快捷键解析 + 源码约定
+python tests/test_all.py       # 75 项：编解码 + 触发逻辑 + 快捷键解析 + 源码约定
 python tests/smoke_gui.py      # 40 项：真建窗口，检查控件、钩子、托盘状态
 python tests/e2e_convert.py    # 17 项：真 Win32 窗口，真按键、真粘贴
 python tests/e2e_notepad.py    #  9 项：开真记事本，验证剪切板还原
+python tests/e2e_roundtrip.py  # 18 项：文字 → 二进制 → 文字 往返（含超长会换行的）
 ```
 
 `e2e_*.py` 会真的动键盘和剪切板，跑之前先把正在编辑的东西存一下。

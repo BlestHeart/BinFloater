@@ -157,6 +157,32 @@ def tap(vk: int, mods=()) -> bool:
     return _send(seq)
 
 
+def tap_many(vk: int, mods=(), count: int = 1, chunk: int = 400) -> bool:
+    """按住 mods 连按 vk 共 count 次，一次 SendInput 发一整批。
+
+    逐个 tap 的话，往左扩 350 个字符就是 350 次 SendInput 系统调用，
+    慢（几百毫秒）而且中途被别的程序抢走输入就会丢。分批发送快得多，
+    实测 350 组 Shift+Right 一次发完能准确落在目标位置。
+    """
+    if count <= 0:
+        return True
+    mods = list(mods)
+    ok = True
+    left = count
+    while left > 0:
+        n = min(left, chunk)
+        seq = []
+        for _ in range(n):
+            seq.extend(_key(m, False) for m in mods)
+            seq.append(_key(vk, False))
+            seq.append(_key(vk, True))
+            seq.extend(_key(m, True) for m in reversed(mods))
+        ok = _send(seq) and ok
+        left -= n
+    return ok
+
+
+
 def foreground_window() -> int:
     """当前前台窗口句柄。用来跳过「自己在前台」的情况。"""
     if not IS_WINDOWS:
@@ -227,23 +253,62 @@ def collapse_selection() -> None:
     tap(VK_RIGHT)
 
 
-def grab_line(timeout: float = COPY_TIMEOUT):
-    """Shift+Home 选中行首到光标，Ctrl+C 复制，返回 (文字, 原来的剪切板)。"""
+def grab_line(timeout: float = COPY_TIMEOUT, attempts: int = 3):
+    """选中「光标所在逻辑行、行首到光标」，Ctrl+C 复制，返回 (文字, 原来的剪切板)。
+
+    为什么不用 Shift+Home：它只选到**视觉行首**。文字转成二进制后长度膨胀约
+    9 倍（UTF-8 每字节 8 位、再加分隔空格），随便一句中文都会自动换行，
+    于是 Shift+Home 只抓到末尾那一小截，反解出来必然是乱码 —— 「转过去再转
+    回来」这条路会彻底失效。
+
+    改用 Ctrl+Shift+Home 选到「文档开头 → 光标」，复制后按换行切出最后一行
+    拿到真正的逻辑行；再把选区从远端收回 len(行首前缀) 个字符，正好剩下
+    「行首 → 光标」。收回用 Shift+Right：Ctrl+Shift+Home 的锚点在光标、活动端
+    在文档开头，所以 Shift+Right 是把活动端往光标方向收。
+
+    重试的原因：选区是要靠目标程序自己处理的，选中的文字越多越慢。程序正忙
+    的时候，Ctrl+C 可能在选区还没建立好就发出去了，复制到的是空的（或上一次
+    的残留）。实测偶发率约五分之一，不重试就会静默返回空行、让转换失败。
+    """
     old = clipwin.read_text()
     seq0 = clipwin.sequence()
 
-    tap(VK_HOME, (VK_SHIFT,))
-    time.sleep(STEP_DELAY)
-    tap(VK_C, (VK_CONTROL,))
+    got = ""
+    for attempt in range(max(1, attempts)):
+        # 第一次之后把选区收掉重来，否则残留选区会让下一次 Ctrl+Shift+Home 行为不一致
+        if attempt:
+            tap(VK_RIGHT)
+            time.sleep(STEP_DELAY)
 
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if clipwin.sequence() != seq0:
-            got = clipwin.read_text()
-            if got:
-                return got, old
-        time.sleep(0.012)
-    return "", old
+        tap(VK_HOME, (VK_CONTROL, VK_SHIFT))
+        # 选中一大段文字比按一下键慢得多，给它一点时间落定再复制
+        time.sleep(STEP_DELAY * 2)
+        tap(VK_C, (VK_CONTROL,))
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if clipwin.sequence() != seq0:
+                got = clipwin.read_text()
+                break
+            time.sleep(0.012)
+        if got:
+            break
+        seq0 = clipwin.sequence()
+
+    if not got:
+        # 什么都没选到，把可能残留的选区收掉，别让用户的光标卡在文档开头
+        tap(VK_RIGHT)
+        return "", old
+
+    # 「文档开头 → 光标」里最后一个换行之后就是光标所在的逻辑行
+    cut = got.rfind("\n") + 1
+    line = got[cut:]
+
+    # 把选区从文档开头收到行首。cut 就是行首之前的字符数，与换行风格无关。
+    if cut > 0:
+        tap_many(VK_RIGHT, (VK_SHIFT,), cut)
+        time.sleep(STEP_DELAY)
+    return line, old
 
 
 def convert_line(convert, restore_clip: bool = True):
