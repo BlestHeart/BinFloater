@@ -7,18 +7,44 @@
 """
 import json
 import os
+import queue
 import sys
 import tkinter as tk
 import tkinter.font as tkfont
 
 import clipwin
 import core
+import keys
+import trigger
 
 APP_NAME = "BinFloater"
 W_WIDTH = 404
 W_HEIGHT = 468  # 兜底值，实际启动后按内容自适应
 COLLAPSED_H = 52
 PLACEHOLDER_RESULT = "复制一段 01001000 01101001 ……\n这里会自动翻译成 Hi"
+
+# 触发方式。默认快捷键：双击空格虽然顺手，但它在任何程序里都会吃掉两个空格，
+# 对不想要这个功能的人来说代价太大，所以让用户自己开。
+TRIGGER_HOTKEY = "hotkey"
+TRIGGER_SPACE = "space"
+TRIGGER_OFF = "off"
+TRIGGER_ORDER = [TRIGGER_HOTKEY, TRIGGER_SPACE, TRIGGER_OFF]
+TRIGGER_TEXT = {
+    TRIGGER_HOTKEY: "快捷键",
+    TRIGGER_SPACE: "双击空格",
+    TRIGGER_OFF: "关闭",
+}
+
+# 转换方向。auto 用 core.auto_detect 判断，跟剪切板卡片的行为一致。
+DIR_AUTO = "auto"
+DIR_TEXT2BIN = "text2bin"
+DIR_BIN2TEXT = "bin2text"
+DIR_ORDER = [DIR_AUTO, DIR_TEXT2BIN, DIR_BIN2TEXT]
+DIR_TEXT = {
+    DIR_AUTO: "自动判断",
+    DIR_TEXT2BIN: "文字→二进制",
+    DIR_BIN2TEXT: "二进制→文字",
+}
 
 # ---- 配色（深色，低饱和，悬浮不刺眼） ----
 BG = "#0f1117"
@@ -105,6 +131,19 @@ class BinFloater:
         self._status_reset_after = None
         self.compact = bool(self.cfg.get("compact", False))
         self.topmost = bool(self.cfg.get("topmost", True))
+        # 触发方式与转换方向
+        self.trigger_mode = self.cfg.get("trigger_mode", TRIGGER_HOTKEY)
+        if self.trigger_mode not in TRIGGER_ORDER:
+            self.trigger_mode = TRIGGER_HOTKEY
+        self.dir_mode = self.cfg.get("dir_mode", DIR_AUTO)
+        if self.dir_mode not in DIR_ORDER:
+            self.dir_mode = DIR_AUTO
+        # 钩子回调在系统线程里跑，绝对不能直接碰 tkinter（会崩）。
+        # 回调只往队列里塞一个事件，主线程用 after 轮询取。
+        self._triggers = queue.Queue()
+        self._watcher = None
+        # 用户最近用的那个窗口。面板按钮触发时要先把焦点还回去。
+        self._last_foreign_hwnd = 0
 
         self._init_window()
         self._init_fonts()
@@ -114,6 +153,8 @@ class BinFloater:
         # 首帧拿到窗口句柄后再切圆角
         self.root.after(30, self._apply_round)
         self.root.after(200, self._poll)
+        self.root.after(120, self._drain_triggers)
+        self._apply_trigger_mode(silent=True)
         self._set_status("正在监视剪切板…", TEAL)
 
     # ---------- 窗口 ----------
@@ -179,6 +220,7 @@ class BinFloater:
 
         self._build_clip_card(self.body)
         self._build_manual_card(self.body)
+        self._build_convert_card(self.body)
 
         self.status = tk.Label(self.shell, text="", bg=BG, fg=MUTED,
                                font=self.font_meta, anchor="w")
@@ -321,6 +363,36 @@ class BinFloater:
                               font=self.font_meta)
         self._hint.pack(side="right")
 
+    def _build_convert_card(self, parent):
+        card = self._card(parent, pady=(0, 8))
+        top = tk.Frame(card, bg=CARD)
+        top.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(top, text="转换当前行", bg=CARD, fg=TEXT,
+                 font=self.font_title).pack(side="left")
+        self.trigger_btn = tk.Label(top, text="", bg=CARD, fg=MUTED,
+                                    font=self.font_meta, padx=6, cursor="hand2")
+        self.trigger_btn.pack(side="right")
+        self.trigger_btn.bind("<Button-1>", lambda e: self._cycle_trigger_mode())
+        self.trigger_btn.bind("<Enter>", lambda e: self.trigger_btn.configure(fg=ACCENT))
+        self.trigger_btn.bind("<Leave>", lambda e: self.trigger_btn.configure(fg=MUTED))
+        self._paint_trigger_btn()
+
+        desc = tk.Label(card, text="把光标所在行（行首到光标）转好后原地粘回，任何程序都能用",
+                        bg=CARD, fg=MUTED, font=self.font_meta, anchor="w",
+                        justify="left", wraplength=340)
+        desc.pack(fill="x", padx=12)
+
+        rows = tk.Frame(card, bg=CARD)
+        rows.pack(fill="x", padx=12, pady=(8, 10))
+        self._btn(rows, "转换这一行", self._convert_line_now, primary=True).pack(side="left")
+        self.dir_btn = tk.Label(rows, text="", bg=CARD, fg=MUTED,
+                                font=self.font_meta, padx=6, cursor="hand2")
+        self.dir_btn.pack(side="right")
+        self.dir_btn.bind("<Button-1>", lambda e: self._cycle_dir_mode())
+        self.dir_btn.bind("<Enter>", lambda e: self.dir_btn.configure(fg=ACCENT))
+        self.dir_btn.bind("<Leave>", lambda e: self.dir_btn.configure(fg=MUTED))
+        self._paint_dir_btn()
+
     def _btn(self, parent, text, cmd, primary=False):
         bg = "#2b3a5e" if primary else CARD_HI
         fg = "#cfe0ff" if primary else MUTED
@@ -416,6 +488,150 @@ class BinFloater:
         self.auto_btn.configure(fg=TEAL if on else MUTED,
                                 text="自动回写 ✓" if on else "自动回写")
 
+    # ---------- 转换当前行 ----------
+    def _paint_trigger_btn(self):
+        self.trigger_btn.configure(
+            fg=MUTED if self.trigger_mode == TRIGGER_OFF else TEAL,
+            text=TRIGGER_TEXT.get(self.trigger_mode, "快捷键"),
+        )
+
+    def _cycle_trigger_mode(self):
+        idx = TRIGGER_ORDER.index(self.trigger_mode)
+        self.trigger_mode = TRIGGER_ORDER[(idx + 1) % len(TRIGGER_ORDER)]
+        self.cfg["trigger_mode"] = self.trigger_mode
+        save_config(self.cfg)
+        self._paint_trigger_btn()
+        self._apply_trigger_mode()
+
+    def _apply_trigger_mode(self, silent=False):
+        """按当前模式装/卸键盘钩子。"""
+        space = self.trigger_mode == TRIGGER_SPACE
+        hotkey = self.trigger_mode == TRIGGER_HOTKEY
+        if space or hotkey:
+            if self._watcher is None:
+                self._watcher = trigger.KeyboardWatcher(
+                    self._on_hotkey_trigger, space_mode=space, hotkey_mode=hotkey
+                )
+                if not self._watcher.install():
+                    self._watcher = None
+                    if not silent:
+                        self._set_status("键盘钩子装不上，可能被安全软件拦了", WARN, 6000)
+                    return
+            else:
+                self._watcher.space_mode = space
+                self._watcher.hotkey_mode = hotkey
+        else:
+            self._release_watcher()
+        if not silent:
+            if self.trigger_mode == TRIGGER_OFF:
+                self._set_status("已关闭快捷键触发", MUTED)
+            elif self.trigger_mode == TRIGGER_SPACE:
+                self._set_status("连按两次空格触发（不按 Ctrl+Alt+B）", TEAL)
+            else:
+                self._set_status("按 Ctrl+Alt+B 触发转换当前行", TEAL)
+
+    def _release_watcher(self):
+        if self._watcher is not None:
+            self._watcher.uninstall()
+            self._watcher = None
+
+    def _on_hotkey_trigger(self, kind):
+        """在系统钩子线程里被调用 —— 这里只能入队，不能碰 tkinter。"""
+        try:
+            self._triggers.put_nowait(kind)
+        except Exception:
+            pass
+
+    def _drain_triggers(self):
+        if not self._alive:
+            return
+        try:
+            while True:
+                kind = self._triggers.get_nowait()
+                self._do_convert_line(kind)
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
+        try:
+            self.root.after(120, self._drain_triggers)
+        except Exception:
+            pass
+
+    def _convert_line_now(self):
+        """面板上的按钮：先把焦点还给刚才那个窗口，再转换。
+
+        切窗口不是一次就成的：Windows 有前台锁定，SetForegroundWindow 常被
+        静默忽略。keys.focus_window 内部已经会走 AttachThreadInput 兜底，但
+        偶尔还是要多试两次，所以这里重试并在失败时明确告诉用户改用什么。
+        """
+        if not self._last_foreign_hwnd:
+            self._do_convert_line("button")
+            return
+
+        target = self._last_foreign_hwnd
+
+        def attempt(left):
+            if keys.focus_window(target):
+                # 焦点切换是异步的，等系统真的把前台还回去再发按键
+                self.root.after(120, lambda: self._do_convert_line("button"))
+                return
+            if left > 0:
+                self.root.after(60, lambda: attempt(left - 1))
+            else:
+                self._set_status("切不回刚才的窗口，请用 Ctrl+Alt+B 触发", WARN, 6000)
+
+        attempt(2)
+
+    def _do_convert_line(self, kind):
+        if not keys.IS_WINDOWS:
+            self._set_status("这个功能只在 Windows 上可用", WARN)
+            return
+        mode = self.dir_mode
+
+        def convert(text):
+            if mode == DIR_TEXT2BIN:
+                return core.text_to_binary(text, sep="" if self.compact else " ")
+            if mode == DIR_BIN2TEXT:
+                out, _msg = core.binary_to_text(text)
+                return out or ""
+            how = core.auto_detect(text)
+            if how == "bin2text":
+                out, _msg = core.binary_to_text(text)
+                return out or ""
+            if how == "text2bin":
+                return core.text_to_binary(text, sep="" if self.compact else " ")
+            return ""
+
+        try:
+            status, src, out, msg = keys.convert_line(convert)
+        except Exception as exc:
+            self._set_status(f"转换失败：{exc}", ERR, 6000)
+            return
+
+        if status == "ok":
+            preview = out if len(out) <= 46 else out[:46] + "…"
+            self._set_status(f"已转换 {len(src)} 字符 → {preview}", OK, 5000)
+        elif status == "empty":
+            self._set_status("光标前面这一行没有文字", WARN)
+        elif status == "same":
+            self._set_status("转换结果和原文一样，没动", MUTED)
+        elif status == "clipfail":
+            self._set_status("写剪切板失败，可能被别的程序占着", ERR, 6000)
+        else:
+            self._set_status("当前窗口不支持这个操作", WARN)
+
+    def _paint_dir_btn(self):
+        self.dir_btn.configure(text=DIR_TEXT.get(self.dir_mode, "自动判断"),
+                               fg=TEAL if self.dir_mode != DIR_AUTO else MUTED)
+
+    def _cycle_dir_mode(self):
+        idx = DIR_ORDER.index(self.dir_mode)
+        self.dir_mode = DIR_ORDER[(idx + 1) % len(DIR_ORDER)]
+        self.cfg["dir_mode"] = self.dir_mode
+        save_config(self.cfg)
+        self._paint_dir_btn()
+
     def _bind_keys(self):
         r = self.root
         r.bind("<Control-q>", lambda e: self._quit())
@@ -427,6 +643,7 @@ class BinFloater:
 
     def _quit(self):
         self._alive = False
+        self._release_watcher()
         try:
             self.cfg["x"] = self.root.winfo_x()
             self.cfg["y"] = self.root.winfo_y()
@@ -473,10 +690,31 @@ class BinFloater:
             pass
 
     # ---------- 剪切板监视 ----------
+    def _own_hwnd(self) -> int:
+        try:
+            return int(self.root.wm_frame(), 16)
+        except Exception:
+            return 0
+
+    def _remember_foreground(self):
+        """记住用户最近用的那个窗口。
+
+        点面板上的「转换这一行」时前台已经变成悬浮窗自己了，所以要提前记住。
+        气泡是 FLAG_NOT_FOCUSABLE 的，点它不会抢焦点，所以这里拿到的基本都是
+        用户真正在打字的那个窗口。
+        """
+        try:
+            hwnd = keys.foreground_window()
+            if hwnd and hwnd != self._own_hwnd():
+                self._last_foreign_hwnd = hwnd
+        except Exception:
+            pass
+
     def _poll(self):
         if not self._alive:
             return
         try:
+            self._remember_foreground()
             seq = clipwin.sequence()
             if seq != self._last_seq:
                 self._last_seq = seq
