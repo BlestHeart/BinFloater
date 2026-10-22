@@ -80,6 +80,11 @@ check("事件已入队", not app._triggers.empty())
 print("=== 托盘 ===")
 check("托盘已启动", app._tray is not None and app._tray.running)
 check("默认不在托盘", app._in_tray is False)
+# 通知文案必须跟当前模式走：快捷键模式下要说快捷键
+check("快捷键模式提示提到快捷键",
+      app.hotkey.text() in app._trigger_text(), app._trigger_text())
+check("托盘 tooltip 跟模式一致",
+      app.hotkey.text() in app._tray.tooltip, app._tray.tooltip)
 app._minimize_to_tray()
 root.update()
 check("最小化后进入托盘", app._in_tray is True)
@@ -97,10 +102,25 @@ app._cycle_space_count()
 check("非空格模式不生效", app.space_count == 2, app.space_count)
 app.trigger_mode = "space"
 app._apply_trigger_mode(silent=True)
+# 空格模式下通知不能再说快捷键——用户实测踩过这个坑：
+# 空格模式收进托盘，通知却写「Ctrl+Alt+B 依然可用」，按了根本没反应。
+check("空格模式提示不提快捷键",
+      app.hotkey.text() not in app._trigger_text(), app._trigger_text())
+check("空格模式提示写连按次数",
+      "%d" % app.space_count in app._trigger_text(), app._trigger_text())
 app._cycle_space_count()
 check("切到 3 下", app.space_count == 3, app.space_count)
 check("同步给钩子", app._watcher.space_count == 3, app._watcher.space_count)
 check("持久化", app.cfg.get("space_count") == 3, app.cfg.get("space_count"))
+check("改次数后提示跟着变", "3" in app._trigger_text(), app._trigger_text())
+check("改次数后 tooltip 跟着变", "3" in app._tray.tooltip, app._tray.tooltip)
+
+print("=== 触发关闭 ===")
+app.trigger_mode = "off"
+app._apply_trigger_mode(silent=True)
+check("关闭模式提示为空", app._trigger_text() == "", app._trigger_text())
+check("关闭模式 tooltip 说明已关闭",
+      "关闭" in app._tray.tooltip, app._tray.tooltip)
 
 print("=== 窗口 ===")
 check("窗口有尺寸", root.winfo_width() > 300, root.winfo_width())

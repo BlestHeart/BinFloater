@@ -490,5 +490,34 @@ class TestStaticChecks(unittest.TestCase):
         # 状态提示里的快捷键文案要跟着用户设置走，不能写死 Ctrl+Alt+B
         self.assertNotIn("请用 Ctrl+Alt+B", self.gui)
 
+    def test_notify_text_follows_trigger_mode(self):
+        # 用户实测踩过：空格模式下收进托盘，通知却写「Ctrl+Alt+B 依然可用」，
+        # 按了根本没反应。通知和托盘提示都必须走 _trigger_text() 现算。
+        self.assertIn("_trigger_text", self.gui)
+        # 收进托盘那条通知里不能再直接拼 hotkey.text()
+        idx = self.gui.find("def _minimize_to_tray")
+        self.assertGreater(idx, 0)
+        body = self.gui[idx:self.gui.find("\n    def ", idx + 10)]
+        self.assertIn("self._trigger_text()", body)
+        self.assertNotIn("self.hotkey.text()", body)
+
+    def test_trigger_text_covers_all_modes(self):
+        # 三种模式都要有说法，off 模式返回空串（通知里换成另一句话）
+        idx = self.gui.find("def _trigger_text")
+        self.assertGreater(idx, 0)
+        body = self.gui[idx:self.gui.find("\n    def ", idx + 10)]
+        self.assertIn("TRIGGER_SPACE", body)
+        self.assertIn("TRIGGER_HOTKEY", body)
+        self.assertIn("self.space_count", body)
+        self.assertIn("self.hotkey.text()", body)
+
+    def test_tooltip_refreshed_on_mode_change(self):
+        # 托盘 tooltip 在 _apply_trigger_mode 里刷新，这样开机恢复配置、
+        # 程序内部改模式都覆盖到，不会漏
+        idx = self.gui.find("def _apply_trigger_mode")
+        self.assertGreater(idx, 0)
+        body = self.gui[idx:self.gui.find("\n    def ", idx + 10)]
+        self.assertIn("self._refresh_tray_tooltip()", body)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

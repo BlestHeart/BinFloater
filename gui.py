@@ -567,6 +567,8 @@ class BinFloater:
         self._paint_trigger_btn()
         self._apply_trigger_mode()
         self._paint_space_btn()
+        # 托盘提示和气泡通知都按当前模式说话，切模式就得跟着改
+        self._refresh_tray_tooltip()
 
     def _apply_trigger_mode(self, silent=False):
         """按当前模式装/卸键盘钩子。"""
@@ -591,6 +593,10 @@ class BinFloater:
                 self._watcher.space_count = self.space_count
         else:
             self._release_watcher()
+        # 托盘 tooltip 写的是「怎么触发」，模式变了就得跟着变。
+        # 放在这里而不是 _cycle_trigger_mode 里：开机恢复配置、程序内部改
+        # trigger_mode 都会走这个函数，放这里才不会有漏网的路径。
+        self._refresh_tray_tooltip()
         if not silent:
             if self.trigger_mode == TRIGGER_OFF:
                 self._set_status("已关闭快捷键触发", MUTED)
@@ -634,6 +640,8 @@ class BinFloater:
             self._watcher.space_count = n
         self._paint_space_btn()
         self._set_status("连按 %d 下空格触发" % n, TEAL)
+        # 空格模式下托盘提示写的是「连按 N 下空格」，改了次数也要同步
+        self._refresh_tray_tooltip()
 
     # ---------- 自定义快捷键 ----------
     def _paint_hotkey_btn(self):
@@ -842,9 +850,11 @@ class BinFloater:
     def _start_tray(self):
         """建托盘图标。失败不影响主功能，只是没有托盘。"""
         try:
+            trig = self._trigger_text()
             self._tray = tray.TrayIcon(
                 self._on_tray_event,
-                tooltip="二进制悬浮窗 · 快捷键 %s" % self.hotkey.text(),
+                tooltip=(("二进制悬浮窗 · %s" % trig) if trig
+                         else "二进制悬浮窗 · 触发已关闭"),
             )
             self._tray.start()
         except Exception:
@@ -907,10 +917,15 @@ class BinFloater:
             self._tray_hint_shown = True
             self.cfg["tray_hint_shown"] = True
             save_config(self.cfg)
-            self._notify_tray(
-                "已收进托盘",
-                "悬浮窗收到托盘了，%s 依然可用。" % self.hotkey.text(),
-            )
+            trig = self._trigger_text()
+            if trig:
+                # 快捷键末尾是 ASCII 字母，跟后面的中文之间要留个空格；
+                # 空格模式的「连按 2 下空格」以汉字结尾，再留空格就松了。
+                sep = " " if self.trigger_mode == TRIGGER_HOTKEY else ""
+                msg = "悬浮窗收到托盘了，%s%s依然可用。" % (trig, sep)
+            else:
+                msg = "悬浮窗收到托盘了。触发已关闭，需要时从托盘叫回来。"
+            self._notify_tray("已收进托盘", msg)
 
     def _notify_tray(self, title, text, warning=False):
         if self._tray is None:
@@ -920,13 +935,27 @@ class BinFloater:
         except Exception:
             return False
 
+    def _trigger_text(self):
+        """当前生效的触发方式的说法，给托盘提示和气泡通知用。
+
+        必须按 trigger_mode 现算，不能写死快捷键：用户在「双击空格」模式下
+        收到的通知却写着「Ctrl+Alt+B 依然可用」，那是在骗人——空格模式下
+        按快捷键根本不会触发。
+        """
+        if self.trigger_mode == TRIGGER_SPACE:
+            return "连按 %d 下空格" % self.space_count
+        if self.trigger_mode == TRIGGER_HOTKEY:
+            return "按 %s" % self.hotkey.text()
+        return ""
+
     def _refresh_tray_tooltip(self):
-        """托盘提示里的快捷键要跟着用户设置走。"""
+        """托盘提示要跟着当前模式走，不能一直写快捷键。"""
         if self._tray is None:
             return
         try:
-            self._tray.tooltip = ("二进制悬浮窗 · 快捷键 %s"
-                                  % self.hotkey.text())[:127]
+            trig = self._trigger_text()
+            self._tray.tooltip = (("二进制悬浮窗 · %s" % trig) if trig
+                                  else "二进制悬浮窗 · 触发已关闭")[:127]
         except Exception:
             pass
 
