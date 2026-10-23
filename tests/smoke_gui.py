@@ -39,7 +39,6 @@ def check(name, cond, detail=""):
     (ok if cond else bad).append(name)
     print(("  PASS  " if cond else "  FAIL  ") + name + (("  " + str(detail)) if detail else ""))
 
-
 print("=== 控件 ===")
 check("转换当前行卡片", hasattr(app, "trigger_btn"))
 check("方向按钮", hasattr(app, "dir_btn"))
@@ -137,6 +136,16 @@ check("关闭模式 tooltip 说明已关闭",
 print("=== 窗口 ===")
 check("窗口有尺寸", root.winfo_width() > 300, root.winfo_width())
 check("窗口有高度", root.winfo_height() > 400, root.winfo_height())
+
+print("=== 启动回显 ===")
+# 用户抱怨过「每次打开都要重新设」，所以启动时状态栏要主动念出恢复的设置。
+check("启动文案带前缀", app._boot_text().startswith("已恢复："), app._boot_text())
+check("启动文案说明触发方式", bool(app._boot_text().strip()), app._boot_text())
+app.trigger_mode = gui.TRIGGER_SPACE
+app.space_count = 4
+check("空格模式下启动文案写次数", "×4" in app._boot_text(), app._boot_text())
+app.trigger_mode = gui.TRIGGER_OFF
+check("关闭模式下启动文案说已关闭", "已关闭" in app._boot_text(), app._boot_text())
 
 app._release_watcher()
 root.destroy()

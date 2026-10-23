@@ -43,7 +43,8 @@ python -m PyInstaller build_onedir.spec --noconfirm --clean
 
 ```bash
 python tests/test_all.py       # 75 项：编解码 + 触发逻辑 + 快捷键解析 + 源码约定
-python tests/smoke_gui.py      # 47 项：真建窗口，检查控件、钩子、托盘状态
+python tests/test_config.py    # 18 项：配置原子写盘、坏文件备份、错误日志
+python tests/smoke_gui.py      # 51 项：真建窗口，检查控件、钩子、托盘状态、启动回显
 python tests/e2e_convert.py    # 17 项：真 Win32 窗口，真按键、真粘贴
 python tests/e2e_notepad.py    #  9 项：开真记事本，验证剪切板还原
 python tests/e2e_roundtrip.py  # 18 项：文字 → 二进制 → 文字 往返（含超长会换行的）
@@ -54,6 +55,26 @@ python tests/e2e_roundtrip.py  # 18 项：文字 → 二进制 → 文字 往返
 `smoke_gui.py` 会把 `APPDATA` 指到临时目录再建窗口，否则测试会把
 `tray_hint_shown`、`space_count` 之类的状态写进你真实的 `config.json`，
 导致「第一次收进托盘时弹提示」这种一次性的行为永远看不到。
+
+## 配置怎么存的
+
+`%APPDATA%\BinFloater\config.json`，纯 JSON，键很少（`trigger_mode`、
+`space_count`、`hotkey`、`dir_mode`、`x`、`y`、`alpha`、`topmost`、
+`compact`、`auto_copy`、`tray_hint_shown`）。改动即时落盘，不等退出。
+
+三个地方是特意这么写的：
+
+1. **原子写**：先写 `config.json.tmp`，`flush` + `fsync`，再 `os.replace`
+   覆盖。直接以 `"w"` 打开原文件会先把它截断，万一进程在写入中途被结束
+   （用户杀进程、崩溃、安全软件拦写盘），留下的就是空文件，下次启动所有
+   设置回到默认值——用户看到的现象就是「怎么没记住」。
+2. **坏文件先备份**：解析失败时把原文件改名成 `config.json.bad` 再退回默认值，
+   不直接覆盖掉，否则用户的改动和问题现场一起没了。
+3. **出错写日志**：`%APPDATA%\BinFloater\error.log`。以前 `except: pass`
+   把所有异常吞掉，线上出问题只能靠猜。
+
+启动时状态栏会主动念一遍恢复出来的设置（`已恢复：空格连按 ×4`），
+这样「到底记没记住」一眼就能看到，不用去翻配置文件。
 
 ## 几个关键设计
 

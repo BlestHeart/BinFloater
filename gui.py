@@ -9,6 +9,7 @@ import json
 import os
 import queue
 import sys
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 
@@ -77,21 +78,64 @@ def config_path() -> str:
     return os.path.join(folder, "config.json")
 
 
+def _log(msg: str) -> None:
+    """写一行诊断日志。配置读写出问题时，没有日志就只能靠猜。"""
+    try:
+        path = os.path.join(os.path.dirname(config_path()), "error.log")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
 def load_config() -> dict:
     try:
         with open(config_path(), "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except Exception:
+            raw = fh.read()
+    except FileNotFoundError:
         return {}
+    except Exception as exc:
+        _log("load_config 读取失败: %r" % (exc,))
+        return {}
+    if not raw.strip():
+        # 空文件说明上次写入被中断了。留个备份，否则下次一保存就永久丢了。
+        _log("load_config: 配置文件是空的")
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception as exc:
+        # 坏掉的配置别直接覆盖掉，先备份一份再退回默认值
+        _log("load_config 解析失败: %r / 原文: %s" % (exc, raw[:400]))
+        try:
+            os.replace(config_path(), config_path() + ".bad")
+        except Exception:
+            pass
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def save_config(data: dict) -> None:
+    """先写临时文件再原子替换。
+
+    直接以 "w" 打开原文件会先把它截断，万一进程在写入中途被结束（用户杀进程、
+    崩溃、安全软件拦截写盘），留下的就是一个空文件——下次启动所有设置回到
+    默认值，用户会以为是「没记住」。os.replace 在 Windows 上也是原子的：
+    要么是旧内容，要么是新内容，不会出现写了一半的状态。
+    """
+    path = config_path()
+    tmp = path + ".tmp"
     try:
-        with open(config_path(), "w", encoding="utf-8") as fh:
+        with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except Exception as exc:
+        _log("save_config 失败: %r / 数据: %r" % (exc, data))
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
 
 
 def _set_text(widget: tk.Text, value: str) -> None:
@@ -183,7 +227,21 @@ class BinFloater:
         self.root.after(120, self._drain_tray_events)
         self._apply_trigger_mode(silent=True)
         self._start_tray()
-        self._set_status("正在监视剪切板…", TEAL)
+        # 启动时把恢复出来的设置念一遍。用户抱怨过「每次打开都要重新设」，
+        # 状态栏直接写清楚这次恢复成了什么，一眼就能确认到底记没记住。
+        self._set_status(self._boot_text(), TEAL, 3200)
+
+    def _boot_text(self):
+        if self.trigger_mode == TRIGGER_SPACE:
+            trig = "空格连按 ×%d" % self.space_count
+        elif self.trigger_mode == TRIGGER_HOTKEY:
+            trig = self.hotkey.text()
+        else:
+            trig = "触发已关闭"
+        parts = [trig]
+        if self.dir_mode != DIR_AUTO:
+            parts.append(DIR_TEXT.get(self.dir_mode, ""))
+        return "已恢复：" + " · ".join(p for p in parts if p)
 
     # ---------- 窗口 ----------
     def _init_window(self):

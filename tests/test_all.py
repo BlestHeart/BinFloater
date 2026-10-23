@@ -3,8 +3,11 @@
 
 不依赖 tkinter（GUI 只做静态检查），所以能在任何 Python 3.8+ 上跑。
 """
+import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 import unittest
 
