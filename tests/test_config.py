@@ -119,6 +119,57 @@ idx = src.find("def load_config")
 body = src[idx:idx + 900]
 check("load_config 会备份坏文件", '" .bad"' in body or '".bad"' in body)
 
+# 12. 类型转换辅助函数：配置是纯文本，用户手改、旧版本遗留、写到一半断电
+#     都可能留下奇怪的值。早先这里是裸的 float(cfg.get(...))，一个
+#     alpha:"abc" 就让程序在建窗口时抛 ValueError，双击 exe 毫无反应。
+check("有 _as_float", "def _as_float(" in src)
+check("有 _as_int", "def _as_int(" in src)
+check("有 _as_bool", "def _as_bool(" in src)
+check("alpha 走 _as_float", '_as_float(self.cfg.get("alpha"' in src)
+check("x 走 _as_int", '_as_int(self.cfg.get("x")' in src)
+check("y 走 _as_int", '_as_int(self.cfg.get("y")' in src)
+def _bare_casts(text):
+    """找出裸的 float(cfg.get / int(cfg.get，排除 _as_float / _as_int 包裹。"""
+    hits = []
+    for line in text.splitlines():
+        for fn in ("float", "int"):
+            needle = fn + "(self.cfg.get("
+            pos = line.find(needle)
+            while pos >= 0:
+                # _as_float( / _as_int( 里的那个不算
+                if not line[:pos].endswith("_as_"):
+                    hits.append(line.strip())
+                    break
+                pos = line.find(needle, pos + 1)
+    return hits
+
+
+check("没有裸 float(cfg.get", not _bare_casts(src), _bare_casts(src)[:2])
+check("没有裸 int(cfg.get", True if not any("int(self.cfg.get(" in h for h in _bare_casts(src)) else False)
+
+# _as_bool 的语义：字符串 "false" 在 Python 里是真值，用户手改配置写成
+# "false" 反而会打开开关，跟直觉相反，所以必须显式识别。
+check("_as_bool 认得 false 字符串", gui._as_bool("false", True) is False)
+check("_as_bool 认得 off 字符串", gui._as_bool("off", True) is False)
+check("_as_bool 认得 no 字符串", gui._as_bool("no", True) is False)
+check("_as_bool 认得 0 字符串", gui._as_bool("0", True) is False)
+check("_as_bool 认得 yes 字符串", gui._as_bool("yes", False) is True)
+check("_as_bool 保留真 bool", gui._as_bool(True, False) is True)
+check("_as_bool 乱值走默认", gui._as_bool("嗯", True) is True)
+check("_as_bool 列表走默认", gui._as_bool([1], False) is False)
+
+check("_as_float 坏值走默认", gui._as_float("abc", 0.9) == 0.9)
+check("_as_float 收 None", gui._as_float(None, 0.9) == 0.9)
+check("_as_float 夹上界", gui._as_float(5.0, 1.0, 0.2, 1.0) == 1.0)
+check("_as_float 夹下界", gui._as_float(0.0, 1.0, 0.2, 1.0) == 0.2)
+check("_as_float 挡 NaN", gui._as_float(float("nan"), 0.9) == 0.9)
+
+check("_as_int 认浮点字符串", gui._as_int("12.0", 0) == 12)
+check("_as_int 坏值走默认", gui._as_int("左边", 7) == 7)
+check("_as_int 收 None", gui._as_int(None, 7) == 7)
+check("_as_int 收列表", gui._as_int([1], 7) == 7)
+check("_as_int 夹上界", gui._as_int(99999999, 0, 0, 100) == 100)
+
 shutil.rmtree(_TMP_APPDATA, ignore_errors=True)
 
 print("")

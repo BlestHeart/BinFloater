@@ -12,6 +12,7 @@ import sys
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from tkinter import filedialog
 
 import clipwin
 import core
@@ -22,9 +23,15 @@ import trigger
 
 APP_NAME = "BinFloater"
 W_WIDTH = 404
+# 宽度可调范围。太窄内容会换行挤成一团，太宽就成了一块盖住半个屏幕的板子。
+MIN_WIDTH = 340
+MAX_WIDTH = 760
 W_HEIGHT = 468  # 兜底值，实际启动后按内容自适应
 COLLAPSED_H = 52
 PLACEHOLDER_RESULT = "复制一段 01001000 01101001 ……\n这里会自动翻译成 Hi"
+# 输入框最多塞多少字。Entry.insert 是超线性的（实测 5 千字 0.44 秒、
+# 2 万字 5.9 秒、5 万字 36 秒），不设上限的话拖个大文本进来就假死。
+MAX_ENTRY_CHARS = 2000
 
 # 触发方式。默认快捷键：空格连按虽然顺手，但它在任何程序里都会吃掉那几个空格，
 # 对不想要这个功能的人来说代价太大，所以让用户自己开。
@@ -114,13 +121,100 @@ def load_config() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def save_config(data: dict) -> None:
-    """先写临时文件再原子替换。
+def _as_float(value, default: float, lo=None, hi=None) -> float:
+    """把配置里的值转成浮点数，坏了就用默认值。
+
+    配置是纯文本文件，用户手改、旧版本遗留、写到一半断电都可能留下奇怪的值。
+    早先这里是裸的类型转换，一个 alpha:"abc" 就让程序在建窗口时抛 ValueError，
+    双击 exe 毫无反应 —— 用户根本不知道发生了什么。
+    """
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    if out != out:  # NaN
+        return default
+    if lo is not None and out < lo:
+        return lo
+    if hi is not None and out > hi:
+        return hi
+    return out
+
+
+def _as_int(value, default: int, lo=None, hi=None) -> int:
+    """把配置里的值转成整数，坏了就用默认值。理由同 _as_float。"""
+    try:
+        # 先过 float：字符串 "3.0" 直接 int() 会炸，但用户手写出来很常见
+        out = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if lo is not None and out < lo:
+        return lo
+    if hi is not None and out > hi:
+        return hi
+    return out
+
+
+def _as_bool(value, default: bool) -> bool:
+    """把配置里的值转成布尔。
+
+    不用 bool(value)：字符串 "false" 在 Python 里是真值，用户手改配置写成
+    "false" 反而会打开开关，跟直觉相反。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("1", "true", "yes", "on"):
+            return True
+        if low in ("0", "false", "no", "off", ""):
+            return False
+    return default
+
+
+def _read_text_file(path: str):
+    """把文件当文本读出来；不像文本就返回 None（交给二进制分支）。
+
+    不能只靠「解码没报错」判断是不是文本：gbk 的编码空间几乎覆盖所有字节
+    序列，随便一个 png 都能"成功"解出一堆乱码汉字。之前就是这样——拖 png
+    进去得到一串无意义汉字，再编码回来的字节自然和原文件不一样。
+    所以两道关：含 NUL 一律当二进制；解出来控制字符（换行制表符除外）
+    超过 2% 也当二进制。
+    """
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    if not data:
+        return None
+    if b"\x00" in data:
+        return None
+    for enc in ("utf-8", "gbk"):
+        try:
+            text = data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        bad = sum(1 for ch in text
+                  if ch < " " and ch not in "\t\n\r" or ch == "\x7f")
+        if text and bad * 50 > len(text):
+            continue
+        return text
+    return None
+
+
+def save_config(data: dict) -> bool:
+    """先写临时文件再原子替换。返回是否写成功。
 
     直接以 "w" 打开原文件会先把它截断，万一进程在写入中途被结束（用户杀进程、
     崩溃、安全软件拦截写盘），留下的就是一个空文件——下次启动所有设置回到
     默认值，用户会以为是「没记住」。os.replace 在 Windows 上也是原子的：
     要么是旧内容，要么是新内容，不会出现写了一半的状态。
+
+    返回布尔值是为了让界面能提示「设置没存上」——之前只写日志，用户完全
+    不知道自己的改动丢了。
     """
     path = config_path()
     tmp = path + ".tmp"
@@ -130,12 +224,14 @@ def save_config(data: dict) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
+        return True
     except Exception as exc:
         _log("save_config 失败: %r / 数据: %r" % (exc, data))
         try:
             os.remove(tmp)
         except Exception:
             pass
+        return False
 
 
 def _set_text(widget: tk.Text, value: str) -> None:
@@ -143,6 +239,29 @@ def _set_text(widget: tk.Text, value: str) -> None:
     widget.delete("1.0", "end")
     widget.insert("1.0", value)
     widget.configure(state="disabled")
+
+
+def screen_bounds(widget) -> tuple:
+    """返回虚拟桌面的 (left, top, width, height)，单位像素。
+
+    多显示器时副屏可能在主屏左边或上边，那时 left/top 是负数。Tk 的
+    winfo_screenwidth() 只给主屏尺寸，拿它算位置会把副屏上的窗口拽回主屏。
+    这里优先问 Win32 的 SM_XVIRTUALSCREEN 那一套；拿不到就退回 Tk 的值
+    （单屏情况下两者一致）。
+    """
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        left = int(user32.GetSystemMetrics(76))    # SM_XVIRTUALSCREEN
+        top = int(user32.GetSystemMetrics(77))     # SM_YVIRTUALSCREEN
+        width = int(user32.GetSystemMetrics(78))   # SM_CXVIRTUALSCREEN
+        height = int(user32.GetSystemMetrics(79))  # SM_CYVIRTUALSCREEN
+        if width > 0 and height > 0:
+            return left, top, width, height
+    except Exception:
+        pass
+    return 0, 0, widget.winfo_screenwidth(), widget.winfo_screenheight()
 
 
 class ReadonlyText(tk.Text):
@@ -180,11 +299,12 @@ class BinFloater:
         self._last_seq = -1
         self._last_clip = None
         self._drag = None
-        self._collapsed = False
         self._flash_after = None
         self._status_reset_after = None
-        self.compact = bool(self.cfg.get("compact", False))
-        self.topmost = bool(self.cfg.get("topmost", True))
+        # 记住上次设的状态文案和颜色，重复设同一个就跳过重绘
+        self._status_text = ""
+        self._status_color = None
+        self.topmost = _as_bool(self.cfg.get("topmost", True), True)
         # 触发方式与转换方向
         self.trigger_mode = self.cfg.get("trigger_mode", TRIGGER_HOTKEY)
         if self.trigger_mode not in TRIGGER_ORDER:
@@ -207,29 +327,90 @@ class BinFloater:
         self._tray = None
         self._tray_events = queue.Queue()
         self._in_tray = False
-        self._tray_hint_shown = bool(self.cfg.get("tray_hint_shown", False))
+        self._tray_hint_shown = _as_bool(self.cfg.get("tray_hint_shown", False), False)
+        # 锁定译文：锁上之后剪切板再变也不覆盖正文，避免用户正在读的内容被冲掉
+        self._result_locked = False
+        # 锁着的时候剪切板变过几次，解锁时提示一下
+        self._pending_clip = None
+        # 第二个实例启动时用它请求唤回窗口（收进托盘后双击 exe 才有反应）
+        self._waker = None
+        # 折叠状态记在配置里，启动时按上次的样子来
+        self._collapsed = _as_bool(self.cfg.get("collapsed", False), False)
+        # 窗口位置标脏：拖动后不立刻写盘，由 _poll 定时落盘（强杀也不丢位置）
+        self._pos_dirty = False
+        self._last_saved_pos = None
+        # 剪切板监视暂停开关
+        self._clip_paused = _as_bool(self.cfg.get("clip_paused", False), False)
+        # 转换历史（最近若干条），存内存不落盘，进程关掉就清空
+        self._history = []
+        # 当前编码格式与分隔符
+        self.fmt = self.cfg.get("format", "binary")
+        if self.fmt not in core.FORMATS:
+            self.fmt = "binary"
+        self.sep = self.cfg.get("separator", "space")
+        if self.sep not in core.SEPARATORS:
+            self.sep = "space"
         # 钩子回调在系统线程里跑，绝对不能直接碰 tkinter（会崩）。
         # 回调只往队列里塞一个事件，主线程用 after 轮询取。
         self._triggers = queue.Queue()
+        # 拖放进来的文件路径，同样由窗口过程入队、主线程取
+        self._drops = queue.Queue()
         self._watcher = None
         # 用户最近用的那个窗口。面板按钮触发时要先把焦点还回去。
         self._last_foreign_hwnd = 0
 
         self._init_window()
         self._init_fonts()
+        # 窗口宽度可调：默认窄条贴在屏幕边上，宽一点能多放候选。
+        # 必须在 _init_window 之后、_build 之前定下来，标题栏文案靠它排版。
+        self.width = _as_int(self.cfg.get("width", W_WIDTH), W_WIDTH,
+                             MIN_WIDTH, MAX_WIDTH)
         self._build()
         self._restore_geometry()
         self._bind_keys()
+        # 上次是折起来的，这次也折着起来。放在 _restore_geometry 之后，
+        # 因为折叠会把窗口高度改成 COLLAPSED_H，得先量出正常高度再折。
+        if self._collapsed:
+            self._set_collapsed(True)
         # 首帧拿到窗口句柄后再切圆角
         self.root.after(30, self._apply_round)
+        # 圆角之后才能子类化（要先有稳定的 hwnd）
+        self.root.after(60, self._setup_drop)
+        self.root.after(180, self._drain_drops)
         self.root.after(200, self._poll)
         self.root.after(120, self._drain_triggers)
         self.root.after(120, self._drain_tray_events)
+        # 透明度/宽度滑块只在松手时落盘，拖动中每次回调都写盘没必要
+        try:
+            self.alpha_scale.bind("<ButtonRelease-1>", self._on_alpha_release)
+        except (AttributeError, tk.TclError):
+            pass
+        try:
+            self.width_scale.bind("<ButtonRelease-1>", self._on_width_release)
+        except (AttributeError, tk.TclError):
+            pass
         self._apply_trigger_mode(silent=True)
         self._start_tray()
+        # 唤醒事件要在托盘建好之后才有意义（没有托盘就没有「收起来叫不回」的问题）
+        self._start_waker()
         # 启动时把恢复出来的设置念一遍。用户抱怨过「每次打开都要重新设」，
         # 状态栏直接写清楚这次恢复成了什么，一眼就能确认到底记没记住。
         self._set_status(self._boot_text(), TEAL, 3200)
+        # 第一次用的人不知道那行「已恢复：Ctrl+Alt+B」是干嘛的，得说清楚
+        self.root.after(600, self._maybe_first_run)
+
+    def _maybe_first_run(self):
+        """首次运行提示：只在从没成功显示过时弹一次。
+
+        判断依据是配置里有没有 first_run_done。用配置而不是「配置文件存在」，
+        因为位置之类的设置也会写配置，装完随手拖一下窗口就再也不会提示了。
+        """
+        if _as_bool(self.cfg.get("first_run_done", False), False):
+            return
+        self.cfg["first_run_done"] = True
+        self._save()
+        self._set_status("第一次用：选中文字后按 %s 就地转换；也可以把剪切板里的内容转过来"
+                         % self.hotkey.text(), TEAL, 9000)
 
     def _boot_text(self):
         if self.trigger_mode == TRIGGER_SPACE:
@@ -249,7 +430,7 @@ class BinFloater:
         r.title(APP_NAME)
         r.overrideredirect(True)
         r.attributes("-topmost", self.topmost)
-        r.attributes("-alpha", float(self.cfg.get("alpha", 1.0)))
+        r.attributes("-alpha", _as_float(self.cfg.get("alpha", 1.0), 1.0, 0.2, 1.0))
         r.configure(bg=BG)
         r.resizable(False, False)
 
@@ -266,18 +447,36 @@ class BinFloater:
         self.font_bin = tkfont.Font(family=mono, size=9)
 
     def _restore_geometry(self):
-        """先让 Tk 量出内容实际高度，再按内容锁定窗口大小，避免底部被截断。"""
-        self.root.geometry(f"{W_WIDTH}x{W_HEIGHT}")
+        """先让 Tk 量出内容实际高度，再按内容锁定窗口大小，避免底部被截断。
+
+        坐标用**虚拟桌面**范围（所有显示器拼起来的那一大块），不是主屏范围。
+        Windows 上副屏在主屏左边时 x 是负数，早先用 `max(0, ...)` 夹一下
+        就把窗口从副屏拽回主屏了 —— 用户上次放在副屏，下次启动突然跑到主屏。
+        """
+        self.root.geometry(f"{self.width}x{W_HEIGHT}")
         self.root.update_idletasks()
-        height = max(300, self.shell.winfo_reqheight())
+        # 不能直接取 shell.winfo_reqheight()：body 装在 Canvas 里，而 Canvas
+        # 不会把内部内容请求的高度往上传，量出来会小一大截，窗口会缩成一条。
+        # 做法是先用内容高度粗算一个值，量出画布还差多少，再精确补上。
+        body_h = self.body.winfo_reqheight()
+        self.root.geometry(f"{self.width}x{max(300, body_h + 120)}")
+        self.root.update_idletasks()
+        short = body_h - self.canvas.winfo_height()
+        height = max(300, self.root.winfo_height() + max(0, short))
+        _left, _top, _vw, _vh = screen_bounds(self.root)
+        # 封顶到屏幕高度的 90%：内容现在 900 出头，1080p 屏刚好放得下；
+        # 1366x768 的笔记本按 90% 算 691，放不下就滚着看（见 _build 的 canvas），
+        # 总比把最下面几行按钮顶到屏幕外点不到好。
+        cap = max(320, int(_vh * 0.90))
+        height = min(height, cap)
         self.height = height
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        x = int(self.cfg.get("x", sw - W_WIDTH - 40))
-        y = int(self.cfg.get("y", 90))
-        x = max(0, min(x, sw - W_WIDTH))
-        y = max(0, min(y, sh - height))
-        self.root.geometry(f"{W_WIDTH}x{height}+{x}+{y}")
+        left, top, vw, vh = screen_bounds(self.root)
+        x = _as_int(self.cfg.get("x"), left + vw - self.width - 40)
+        y = _as_int(self.cfg.get("y"), top + 90)
+        # 夹到虚拟桌面范围内：太靠外会跑到屏幕之外点不到
+        x = max(left, min(x, left + vw - self.width))
+        y = max(top, min(y, top + vh - height))
+        self.root.geometry(f"{self.width}x{height}+{x}+{y}")
         self.root.update_idletasks()
 
     def _apply_round(self):
@@ -291,6 +490,129 @@ class BinFloater:
         except Exception:
             pass
 
+    def _setup_drop(self):
+        """接管窗口过程，接收拖进来的文件。
+
+        Tkinter 不处理 WM_DROPFILES，只能自己子类化窗口过程：SetWindowLongPtr
+        换掉原来的 WndProc，新过程里看到 WM_DROPFILES 就取路径入队，其余消息
+        一律转给原过程。原过程句柄必须存住，否则被 GC 掉就成了野指针（会直接崩）。
+        """
+        if not clipwin.IS_WINDOWS:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u = ctypes.windll.user32
+            # 64 位要用 SetWindowLongPtrW
+            is64 = ctypes.sizeof(ctypes.c_void_p) == 8
+            setter = u.SetWindowLongPtrW if is64 else u.SetWindowLongW
+            setter.restype = ctypes.c_void_p
+            setter.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            u.CallWindowProcW.restype = ctypes.c_void_p
+            u.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND,
+                                          wintypes.UINT, wintypes.WPARAM,
+                                          wintypes.LPARAM]
+
+            self.root.update_idletasks()
+            hwnd = int(self.root.wm_frame(), 16)
+            WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_void_p, wintypes.HWND,
+                                         wintypes.UINT, wintypes.WPARAM,
+                                         wintypes.LPARAM)
+            GWLP_WNDPROC = -4
+            old = setter(hwnd, GWLP_WNDPROC, None)
+            self._old_wndproc = old
+
+            def _proc(h, msg, wp, lp):
+                if msg == clipwin.WM_DROPFILES:
+                    try:
+                        paths = clipwin.read_dropped_files(wp)
+                        if paths:
+                            # 窗口过程跑在消息循环里，不能直接动 Tk 控件
+                            self._drops.put_nowait(paths)
+                    except Exception:
+                        pass
+                    return 0
+                return u.CallWindowProcW(old, h, msg, wp, lp)
+
+            # 必须存成实例属性，否则回调对象被回收后系统还会回调它
+            self._wndproc = WNDPROC(_proc)
+            setter(hwnd, GWLP_WNDPROC,
+                   ctypes.cast(self._wndproc, ctypes.c_void_p))
+            # DragAcceptFiles 在 shell32 里，不是 user32
+            clipwin.accept_dropped_files(hwnd)
+            self._drop_hwnd = hwnd
+        except Exception:
+            self._drop_hwnd = 0
+
+    def _drain_drops(self):
+        """主线程：把窗口过程收到的拖放路径取出来处理。"""
+        if not self._alive:
+            return
+        try:
+            while True:
+                paths = self._drops.get_nowait()
+                for path in paths:
+                    self._load_dropped(path)
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
+        try:
+            self.root.after(120, self._drain_drops)
+        except tk.TclError:
+            pass
+
+    def _load_dropped(self, path):
+        """把拖进来的文件读进输入框。
+
+        文本文件走编码；图片之类读不了就当二进制文件处理（把内容编成 0/1 串），
+        不然用户拖个 png 进来只会得到一句「读不了」。
+        """
+        try:
+            size = os.path.getsize(path)
+        except OSError as exc:
+            self._set_status("读不了这个文件：%s" % exc, ERR, 6000)
+            return
+        if os.path.isdir(path):
+            self._set_status("拖的是文件夹，只能拖单个文件进来", WARN, 5000)
+            return
+        if size > 8 * 1024 * 1024:
+            self._set_status("文件太大（%d MB），最多 8MB" % (size // (1024 * 1024)),
+                             WARN, 6000)
+            return
+        text = _read_text_file(path)
+        if text is not None:
+            # 太长的话 _fill_manual 会走旁路（直接转好放结果区），
+            # 它自己已经给过提示，这里别再覆盖成「已读入（文本）」，
+            # 不然用户会以为没读到东西。
+            if not self._fill_manual(text):
+                self._set_status("已读入 %s（文本）" % os.path.basename(path),
+                                 OK, 5000)
+            return
+        # 不是文本，当二进制文件：内容 -> 0/1 串。
+        # 这一支要另外卡一道上限：每字节会变成 9 个字符（8 位 + 1 空格），
+        # 8MB 的文件就是 75MB 的字符串塞进 Text 控件，界面会彻底卡死
+        # （实测 1MB 已经要 0.64 秒，只算生成时间）。
+        if size > 512 * 1024:
+            self._set_status(
+                "这个文件不是文本，转成 0/1 串会太长（%d KB），最多 512KB"
+                % (size // 1024), WARN, 6000)
+            return
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            self._set_status("读不了这个文件：%s" % exc, ERR, 6000)
+            return
+        self.entry.delete(0, "end")
+        self.input_var.set("")
+        self.bin_out.set_text(
+            core.apply_separator(core.bytes_to_binary(data), self.sep))
+        # 别走 _on_input：那会把输入框的空内容再编一遍，把刚写进去的结果清掉
+        self.len_badge.configure(text="%d 字节" % len(data))
+        self._set_status("已把 %s 的字节编成 0/1 串（%d 字节）"
+                         % (os.path.basename(path), len(data)), OK, 6000)
+
     # ---------- 界面 ----------
     def _build(self):
         root = self.root
@@ -300,23 +622,79 @@ class BinFloater:
 
         self._build_header(self.shell)
 
-        self.body = tk.Frame(self.shell, bg=BG)
-        self.body.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        # 卡片越加越多，全摊开会比 1080p 屏还高。用一个可滚动容器装起来：
+        # 窗口高度封顶到屏幕的 82%，超出的部分滚着看。
+        wrap = tk.Frame(self.shell, bg=BG)
+        wrap.pack(fill="both", expand=True)
+        self.scroll_wrap = wrap
+        self.scrollbar = tk.Scrollbar(wrap, orient="vertical", width=6,
+                                      bg=CARD_HI, troughcolor=BG,
+                                      activebackground=STROKE,
+                                      highlightthickness=0, bd=0,
+                                      relief="flat")
+        self.canvas = tk.Canvas(wrap, bg=BG, highlightthickness=0, bd=0,
+                                yscrollcommand=self.scrollbar.set)
+        self.scrollbar.configure(command=self.canvas.yview)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.body = tk.Frame(self.canvas, bg=BG)
+        self._body_win = self.canvas.create_window(
+            (0, 0), window=self.body, anchor="nw")
         self._draggable(self.body)
+
+        def _sync_scroll(_event=None):
+            """内容变高/变矮时同步可滚范围，并把画布宽度撑满。"""
+            try:
+                self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+                self.canvas.itemconfigure(self._body_win,
+                                          width=self.canvas.winfo_width())
+                need = self.body.winfo_reqheight()
+                avail = self.canvas.winfo_height()
+                if need > avail and avail > 1:
+                    if not self.scrollbar.winfo_ismapped():
+                        self.scrollbar.pack(side="right", fill="y")
+                elif self.scrollbar.winfo_ismapped():
+                    self.scrollbar.pack_forget()
+            except tk.TclError:
+                pass
+
+        self.body.bind("<Configure>", _sync_scroll)
+        self.canvas.bind("<Configure>", _sync_scroll)
+        # 鼠标滚轮只在指针落在窗口上时才滚，别抢别处的滚轮
+        for widget in (self.canvas, self.body):
+            widget.bind("<Enter>", lambda e: self._bind_wheel())
+            widget.bind("<Leave>", lambda e: self._unbind_wheel())
+        self._scroll_sync = _sync_scroll
 
         self._build_clip_card(self.body)
         self._build_manual_card(self.body)
         self._build_convert_card(self.body)
+        self._build_history_card(self.body)
+        self._build_settings_card(self.body)
 
         self.status = tk.Label(self.shell, text="", bg=BG, fg=MUTED,
                                font=self.font_meta, anchor="w")
         self.status.pack(fill="x", padx=16, pady=(0, 8))
 
+    def _bind_wheel(self):
+        self.root.bind_all("<MouseWheel>", self._on_wheel)
+
+    def _unbind_wheel(self):
+        self.root.unbind_all("<MouseWheel>")
+
+    def _on_wheel(self, event):
+        """滚轮翻内容。Windows 上一次滚动 delta 是 120 的倍数。"""
+        try:
+            if self.scrollbar.winfo_ismapped():
+                self.canvas.yview_scroll(int(-event.delta / 120), "units")
+        except tk.TclError:
+            pass
+
     def _draggable(self, widget):
         """让空白区域也能拖动窗口（输入框/按钮自己绑定了点击，不会被覆盖）。"""
         widget.bind("<Button-1>", self._drag_start)
         widget.bind("<B1-Motion>", self._drag_move)
-        widget.bind("<Double-Button-1>", lambda e: self._toggle_collapse())
+        widget.bind("<ButtonRelease-1>", self._drag_end)
+        widget.bind("<Double-Button-1>", self._guard_text(lambda: self._toggle_collapse()))
         return widget
 
     def _build_header(self, parent):
@@ -324,6 +702,7 @@ class BinFloater:
         head.pack(fill="x", padx=12, pady=(10, 8))
         head.bind("<Button-1>", self._drag_start)
         head.bind("<B1-Motion>", self._drag_move)
+        head.bind("<ButtonRelease-1>", self._drag_end)
         head.bind("<Double-Button-1>", lambda e: self._toggle_collapse())
 
         dot = tk.Canvas(head, width=10, height=10, bg=BG, highlightthickness=0)
@@ -336,6 +715,7 @@ class BinFloater:
         self.title_lbl = title
         title.bind("<Button-1>", self._drag_start)
         title.bind("<B1-Motion>", self._drag_move)
+        title.bind("<ButtonRelease-1>", self._drag_end)
         title.bind("<Double-Button-1>", lambda e: self._toggle_collapse())
 
         self._hbtn(head, "✕", self._quit, hover=ERR)
@@ -369,14 +749,22 @@ class BinFloater:
 
         tk.Label(top, text="剪切板识别", bg=CARD, fg=TEXT,
                  font=self.font_title).pack(side="left")
+        # 暂停开关：处理敏感内容时不想让程序一直读剪切板
+        self.pause_btn = tk.Label(top, text="", bg=CARD, fg=MUTED,
+                                  font=self.font_meta, padx=6, cursor="hand2")
+        self.pause_btn.pack(side="right")
+        self.pause_btn.bind("<Button-1>", lambda e: self._toggle_clip_pause())
+        self.pause_btn.bind("<Enter>", lambda e: self.pause_btn.configure(fg=ACCENT))
+        self.pause_btn.bind("<Leave>", lambda e: self._paint_pause_btn())
+        self._paint_pause_btn()
         self.clip_badge = tk.Label(top, text="等待 0/1 串", bg=CARD, fg=MUTED,
                                    font=self.font_meta)
-        self.clip_badge.pack(side="right")
+        self.clip_badge.pack(side="right", padx=(0, 8))
 
         box = tk.Frame(card, bg=CARD_HI)
         box.pack(fill="x", padx=12)
         self.result = ReadonlyText(
-            box, height=5, wrap="char", bg=CARD_HI, fg=TEXT,
+            box, height=4, wrap="char", bg=CARD_HI, fg=TEXT,
             font=self.font_result, relief="flat", bd=0,
             highlightthickness=0, padx=10, pady=8,
             insertbackground=TEXT, selectbackground="#33507e",
@@ -388,12 +776,28 @@ class BinFloater:
         self.result.configure(state="disabled", fg="#5b6579")
 
         rows = tk.Frame(card, bg=CARD)
-        rows.pack(fill="x", padx=12, pady=(8, 10))
+        rows.pack(fill="x", padx=12, pady=(8, 4))
         self._btn(rows, "复制译文", self._copy_result, primary=True).pack(side="left")
-        self._btn(rows, "→ 转二进制", self._clip_to_bin).pack(side="left", padx=6)
-        self._btn(rows, "清空", self._clear_result).pack(side="left")
-        self.auto_btn = tk.Label(rows, text="", bg=CARD, fg=MUTED,
-                                 font=self.font_meta, padx=6, cursor="hand2")
+        self._btn(rows, "→ 转编码", self._clip_to_bin).pack(side="left", padx=6)
+        # 反向：把当前译文当原文再转回去。之前想往返一次得先复制再粘贴，两步
+        self._btn(rows, "⇄ 反向", self._reverse_result).pack(side="left")
+        self._btn(rows, "清空", self._clear_result).pack(side="left", padx=6)
+
+        # 锁定 / 自动回写单独一行：四个按钮加上它俩挤在一行，
+        # 404 宽的窗口里「自动回写」会被压成两行，很难看
+        opts = tk.Frame(card, bg=CARD)
+        opts.pack(fill="x", padx=12, pady=(0, 10))
+        # 锁：剪切板一变就把译文冲掉，用户正在读的东西当场消失。锁上之后
+        # 只更新角标提示「剪切板变了」，正文不动，想换再看就解锁。
+        self.lock_btn = tk.Label(opts, text="锁定", bg=CARD, fg=MUTED,
+                                 font=self.font_meta, cursor="hand2")
+        self.lock_btn.pack(side="left")
+        self.lock_btn.bind("<Button-1>", lambda e: self._toggle_result_lock())
+        self.lock_btn.bind("<Enter>", lambda e: self.lock_btn.configure(fg=ACCENT))
+        self.lock_btn.bind("<Leave>", lambda e: self._paint_lock_btn())
+        self._paint_lock_btn()
+        self.auto_btn = tk.Label(opts, text="", bg=CARD, fg=MUTED,
+                                 font=self.font_meta, cursor="hand2")
         self.auto_btn.pack(side="right")
         self.auto_btn.bind("<Button-1>", lambda e: self._toggle_auto_copy())
         self.auto_btn.bind("<Enter>", lambda e: self.auto_btn.configure(fg=ACCENT))
@@ -404,18 +808,33 @@ class BinFloater:
         card = self._card(parent, pady=(0, 8))
         top = tk.Frame(card, bg=CARD)
         top.pack(fill="x", padx=12, pady=(10, 6))
-        tk.Label(top, text="文字 → 二进制", bg=CARD, fg=TEXT,
+        tk.Label(top, text="文字 → 编码", bg=CARD, fg=TEXT,
                  font=self.font_title).pack(side="left")
         self.len_badge = tk.Label(top, text="", bg=CARD, fg=MUTED, font=self.font_meta)
         self.len_badge.pack(side="right")
-        self.compact_btn = tk.Label(top, text="紧凑", bg=CARD, fg=MUTED,
-                                    font=self.font_meta, padx=6, cursor="hand2")
-        self.compact_btn.pack(side="right", padx=(0, 8))
-        self.compact_btn.bind("<Button-1>", lambda e: self._toggle_compact())
-        self.compact_btn.bind("<Enter>", lambda e: self.compact_btn.configure(fg=ACCENT))
-        self.compact_btn.bind("<Leave>", lambda e: self.compact_btn.configure(fg=MUTED))
-        self._paint_compact_btn()
 
+        # 编码格式 + 分隔符行。放在标题下面单独一行：之前只有「紧凑」一个开关，
+        # 想换个格式（十六进制/Base64/摩斯）根本没地方点。
+        fmtrow = tk.Frame(card, bg=CARD)
+        fmtrow.pack(fill="x", padx=12, pady=(0, 6))
+        tk.Label(fmtrow, text="格式", bg=CARD, fg=MUTED,
+                 font=self.font_meta).pack(side="left")
+        self.fmt_btn = tk.Label(fmtrow, text="", bg=CARD_HI, fg=TEAL,
+                                font=self.font_meta, padx=8, pady=2,
+                                cursor="hand2")
+        self.fmt_btn.pack(side="left", padx=(8, 0))
+        self.fmt_btn.bind("<Button-1>", lambda e: self._cycle_format())
+        self.fmt_btn.bind("<Enter>", lambda e: self.fmt_btn.configure(bg=STROKE))
+        self.fmt_btn.bind("<Leave>", lambda e: self.fmt_btn.configure(bg=CARD_HI))
+        self.sep_btn = tk.Label(fmtrow, text="", bg=CARD_HI, fg=MUTED,
+                                font=self.font_meta, padx=8, pady=2,
+                                cursor="hand2")
+        self.sep_btn.pack(side="left", padx=(6, 0))
+        self.sep_btn.bind("<Button-1>", lambda e: self._cycle_separator())
+        self.sep_btn.bind("<Enter>", lambda e: self.sep_btn.configure(bg=STROKE))
+        self.sep_btn.bind("<Leave>", lambda e: self.sep_btn.configure(bg=CARD_HI))
+        self._paint_format_btn()
+        self._paint_separator_btn()
         # 输入框（带占位提示）
         entry_wrap = tk.Frame(card, bg=CARD_HI)
         entry_wrap.pack(fill="x", padx=12)
@@ -442,13 +861,33 @@ class BinFloater:
         self.bin_out.on_copy = self._copy_any
 
         rows = tk.Frame(card, bg=CARD)
-        rows.pack(fill="x", padx=12, pady=(8, 10))
-        self._btn(rows, "复制二进制", self._copy_binary, primary=True).pack(side="left")
+        rows.pack(fill="x", padx=12, pady=(8, 4))
+        self.copy_btn = self._btn(rows, "复制编码", self._copy_binary, primary=True)
+        self.copy_btn.pack(side="left")
         self._btn(rows, "← 从剪切板", self._paste_text).pack(side="left", padx=6)
         self._btn(rows, "清空", self._clear_manual).pack(side="left")
         self._hint = tk.Label(rows, text="Enter 复制", bg=CARD, fg="#5b6579",
                               font=self.font_meta)
         self._hint.pack(side="right")
+
+        # 第二行：多行批量 / 从文件读 / 导出 / 解码为文件
+        # 挤在一行会爆（窗口只有 404 宽），所以「解码为文件」另起一行
+        rows2 = tk.Frame(card, bg=CARD)
+        rows2.pack(fill="x", padx=12, pady=(0, 8))
+        self.batch_btn = self._btn(rows2, "多行批量", self._batch_convert)
+        self.batch_btn.pack(side="left")
+        self._btn(rows2, "从文件读", self._load_from_file).pack(side="left", padx=6)
+        self._btn(rows2, "导出结果", self._export_result).pack(side="left")
+        self.batch_hint = tk.Label(rows2, text="", bg=CARD, fg="#5b6579",
+                                   font=self.font_meta)
+        self.batch_hint.pack(side="right")
+
+        # 第三行：把结果区的 0/1 串解成字节存文件（还原图片/压缩包用）
+        rows3 = tk.Frame(card, bg=CARD)
+        rows3.pack(fill="x", padx=12, pady=(0, 8))
+        self._btn(rows3, "解码为文件", self._decode_to_file).pack(side="left")
+        tk.Label(rows3, text="把 0/1 串还原成字节存盘",
+                 bg=CARD, fg="#5b6579", font=self.font_meta).pack(side="right")
 
     def _build_convert_card(self, parent):
         card = self._card(parent, pady=(0, 8))
@@ -465,6 +904,8 @@ class BinFloater:
         rows = tk.Frame(card, bg=CARD)
         rows.pack(fill="x", padx=12, pady=(8, 4))
         self._btn(rows, "转换这一行", self._convert_line_now, primary=True).pack(side="left")
+        self._btn(rows, "转换选中", self._convert_selection_now).pack(side="left",
+                                                                   padx=(6, 0))
         self.dir_btn = tk.Label(rows, text="", bg=CARD, fg=MUTED,
                                 font=self.font_meta, padx=6, cursor="hand2")
         self.dir_btn.pack(side="right")
@@ -498,7 +939,7 @@ class BinFloater:
         # 快捷键行。单独一行放，因为录制时这里要变成提示文字，
         # 挤在按钮行里会把「转换这一行」挤变形。
         keyrow = tk.Frame(card, bg=CARD)
-        keyrow.pack(fill="x", padx=12, pady=(0, 10))
+        keyrow.pack(fill="x", padx=12, pady=(0, 8))
         tk.Label(keyrow, text="快捷键", bg=CARD, fg=MUTED,
                  font=self.font_meta).pack(side="left")
         self.hotkey_btn = tk.Label(keyrow, text="", bg=CARD_HI, fg=TEAL,
@@ -520,7 +961,7 @@ class BinFloater:
         # 连按次数。只在「空格连按」模式下有意义，切到快捷键模式时整行变灰，
         # 免得用户以为调了没用（其实是不生效）。
         spacerow = tk.Frame(card, bg=CARD)
-        spacerow.pack(fill="x", padx=12, pady=(0, 10))
+        spacerow.pack(fill="x", padx=12, pady=(0, 8))
         self.space_lbl = tk.Label(spacerow, text="连按空格", bg=CARD, fg=MUTED,
                                   font=self.font_meta)
         self.space_lbl.pack(side="left")
@@ -537,6 +978,209 @@ class BinFloater:
                                    font=self.font_meta)
         self.space_hint.pack(side="right")
         self._paint_space_btn()
+
+    def _build_history_card(self, parent):
+        """转换历史。
+
+        只放最近 6 条：这东西是「刚才那版是什么来着」的后悔药，不是日志。
+        点一下就复制，不用再去结果区全选。
+        """
+        card = self._card(parent, pady=(0, 8))
+        top = tk.Frame(card, bg=CARD)
+        top.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(top, text="转换历史", bg=CARD, fg=TEXT,
+                 font=self.font_title).pack(side="left")
+        self.history_btn = tk.Label(top, text="清空", bg=CARD, fg=MUTED,
+                                    font=self.font_meta, padx=6, cursor="hand2")
+        self.history_btn.pack(side="right")
+        self.history_btn.bind("<Button-1>", lambda e: self._clear_history())
+        self.history_btn.bind("<Enter>",
+                              lambda e: self.history_btn.configure(fg=ACCENT))
+        self.history_btn.bind("<Leave>",
+                              lambda e: self.history_btn.configure(fg=MUTED))
+
+        self.history_box = tk.Frame(card, bg=CARD)
+        self.history_box.pack(fill="x", padx=12, pady=(0, 8))
+        self._paint_history()
+
+    def _clear_history(self):
+        self._history = []
+        self._paint_history()
+        self._set_status("转换历史已清空", MUTED, 3000)
+
+    def _build_settings_card(self, parent):
+        """设置：透明度滑块 + 恢复默认。
+
+        透明度原来是标题栏那个 ◐ 按钮循环四档，用户得点开才知道现在几档、
+        点几下能到自己想要的值。换成滑块直接拖，拖到哪就是哪。
+        """
+        card = self._card(parent, pady=(0, 8))
+        top = tk.Frame(card, bg=CARD)
+        top.pack(fill="x", padx=12, pady=(10, 4))
+        tk.Label(top, text="设置", bg=CARD, fg=TEXT,
+                 font=self.font_title).pack(side="left")
+        self.reset_btn = tk.Label(top, text="恢复默认", bg=CARD, fg=MUTED,
+                                  font=self.font_meta, padx=6, cursor="hand2")
+        self.reset_btn.pack(side="right")
+        self.reset_btn.bind("<Button-1>", lambda e: self._reset_defaults())
+        self.reset_btn.bind("<Enter>",
+                            lambda e: self.reset_btn.configure(fg=WARN))
+        self.reset_btn.bind("<Leave>",
+                            lambda e: self.reset_btn.configure(fg=MUTED))
+
+        arow = tk.Frame(card, bg=CARD)
+        arow.pack(fill="x", padx=12, pady=(0, 8))
+        tk.Label(arow, text="不透明度", bg=CARD, fg=MUTED,
+                 font=self.font_meta, width=6, anchor="w").pack(side="left")
+        cur_alpha = _as_float(self.cfg.get("alpha", 1.0), 1.0, 0.2, 1.0)
+        self.alpha_var = tk.DoubleVar(value=cur_alpha * 100)
+        self.alpha_scale = tk.Scale(
+            arow, from_=25, to=100, orient="horizontal",
+            variable=self.alpha_var, showvalue=False,
+            bg=CARD, fg=MUTED, troughcolor=CARD_HI, highlightthickness=0,
+            bd=0, sliderrelief="flat", activebackground=ACCENT,
+            length=180, command=self._on_alpha_slide,
+        )
+        self.alpha_scale.pack(side="left", fill="x", expand=True, padx=(4, 6))
+        self.alpha_lbl = tk.Label(arow, text="%d%%" % int(cur_alpha * 100),
+                                  bg=CARD, fg=TEAL, font=self.font_meta,
+                                  width=4, anchor="e")
+        self.alpha_lbl.pack(side="right")
+
+        # 宽度滑块：默认 404 是照最长的按钮行定的，屏幕宽的人会觉得窄，
+        # 想一屏多看几条译文就只能忍。拖动实时改，松手才落盘。
+        wrow = tk.Frame(card, bg=CARD)
+        wrow.pack(fill="x", padx=12, pady=(0, 8))
+        tk.Label(wrow, text="宽度", bg=CARD, fg=MUTED,
+                 font=self.font_meta, width=6, anchor="w").pack(side="left")
+        self.width_var = tk.DoubleVar(value=self.width)
+        self.width_scale = tk.Scale(
+            wrow, from_=MIN_WIDTH, to=MAX_WIDTH, orient="horizontal",
+            variable=self.width_var, showvalue=False,
+            bg=CARD, fg=MUTED, troughcolor=CARD_HI, highlightthickness=0,
+            bd=0, sliderrelief="flat", activebackground=ACCENT,
+            length=180, command=self._on_width_slide,
+        )
+        self.width_scale.pack(side="left", fill="x", expand=True, padx=(4, 6))
+        self.width_lbl = tk.Label(wrow, text="%dpx" % self.width,
+                                  bg=CARD, fg=TEAL, font=self.font_meta,
+                                  width=6, anchor="e")
+        self.width_lbl.pack(side="right")
+
+    def _on_alpha_slide(self, _value):
+        """滑块拖动时实时改窗口透明度。
+
+        不写盘：拖动过程中会来几十次回调，每次都落盘等于拿磁盘当草稿纸。
+        松手（ButtonRelease）时才存，见 __init__ 里绑的那个事件。
+        """
+        try:
+            pct = float(self.alpha_var.get())
+        except (tk.TclError, ValueError):
+            return
+        alpha = max(0.25, min(1.0, pct / 100.0))
+        try:
+            self.root.attributes("-alpha", alpha)
+            self.alpha_lbl.configure(text="%d%%" % int(round(alpha * 100)))
+        except tk.TclError:
+            pass
+
+    def _on_alpha_release(self, _event=None):
+        try:
+            alpha = round(max(0.25, min(1.0, float(self.alpha_var.get()) / 100.0)), 2)
+        except (tk.TclError, ValueError):
+            return
+        self.cfg["alpha"] = alpha
+        self._save()
+
+    def _on_width_slide(self, _value):
+        """拖动时实时改窗口宽度。同透明度：拖动中不落盘。"""
+        try:
+            want = int(round(float(self.width_var.get())))
+        except (tk.TclError, ValueError):
+            return
+        self._apply_width(want, persist=False)
+
+    def _on_width_release(self, _event=None):
+        try:
+            want = int(round(float(self.width_var.get())))
+        except (tk.TclError, ValueError):
+            return
+        self._apply_width(want, persist=True)
+
+    def _apply_width(self, want, persist=False):
+        want = max(MIN_WIDTH, min(MAX_WIDTH, int(want)))
+        if want == self.width:
+            if persist:
+                self.cfg["width"] = want
+                self._save()
+            return
+        self.width = want
+        try:
+            self.width_lbl.configure(text="%dpx" % want)
+        except tk.TclError:
+            pass
+        # 折叠时高度是 COLLAPSED_H，展开时是自己的高度，两种情况都要重设，
+        # 否则拖完滑块窗口宽度不变，看起来像没生效。
+        h = COLLAPSED_H if self._collapsed else self.height
+        try:
+            self.root.geometry(f"{want}x{h}")
+            self.root.update_idletasks()
+            self.root.after(30, self._apply_round)
+        except tk.TclError:
+            return
+        if persist:
+            self.cfg["width"] = want
+            self._save()
+
+    def _reset_defaults(self):
+        """把能改的设置全部恢复出厂值。
+
+        只重置「设置」不重置窗口位置和转换历史：位置是用户的桌面布局，
+        跟设置无关，重置掉反而更烦人。
+        """
+        self.trigger_mode = TRIGGER_HOTKEY
+        self.space_count = 2
+        self.hotkey_spec = hotkey_mod.DEFAULT_HOTKEY
+        self.hotkey = hotkey_mod.parse(self.hotkey_spec)
+        self.dir_mode = DIR_AUTO
+        self.fmt = "binary"
+        self.sep = "space"
+        self._clip_paused = False
+        self.topmost = True
+        self.cfg["trigger_mode"] = self.trigger_mode
+        self.cfg["space_count"] = self.space_count
+        self.cfg["hotkey"] = self.hotkey_spec
+        self.cfg["dir_mode"] = self.dir_mode
+        self.cfg["format"] = self.fmt
+        self.cfg["separator"] = self.sep
+        self.cfg["clip_paused"] = False
+        self.cfg["topmost"] = True
+        self.cfg["alpha"] = 1.0
+        self.cfg["width"] = W_WIDTH
+        self._save()
+        try:
+            self.root.attributes("-topmost", True)
+            self.root.attributes("-alpha", 1.0)
+            self.alpha_var.set(100)
+            self.alpha_lbl.configure(text="100%")
+            self.width_var.set(W_WIDTH)
+        except tk.TclError:
+            pass
+        self._apply_width(W_WIDTH, persist=False)
+        if self._watcher is not None:
+            self._apply_trigger_mode()
+        self._paint_trigger_btn()
+        self._paint_hotkey_btn()
+        self._paint_space_btn()
+        self._paint_dir_btn()
+        self._paint_format_btn()
+        self._paint_separator_btn()
+        self._paint_pause_btn()
+        self._paint_auto_btn()
+        self._on_input()
+        self.pin_btn.configure(fg=TEAL, text="◉")
+        self._refresh_tray_tooltip()
+        self._set_status("已恢复默认设置", TEAL, 5000)
 
     def _btn(self, parent, text, cmd, primary=False):
         bg = "#2b3a5e" if primary else CARD_HI
@@ -558,37 +1202,72 @@ class BinFloater:
             return
         x = event.x_root - self._drag[0]
         y = event.y_root - self._drag[1]
-        x = max(-40, min(x, self.root.winfo_screenwidth() - 80))
-        y = max(0, min(y, self.root.winfo_screenheight() - 40))
+        # 用虚拟桌面范围夹，副屏在左边时 x 可以是负数
+        left, top, vw, vh = screen_bounds(self.root)
+        x = max(left - 40, min(x, left + vw - 80))
+        y = max(top, min(y, top + vh - 40))
         self.root.geometry(f"+{x}+{y}")
+        # 拖动结束会走 _save_position，这里只标脏，别每次 MOVE 都写盘
+        self._pos_dirty = True
+
+    def _drag_end(self, event=None):
+        """松手才算一次拖动结束，这时才真的写盘。"""
+        if self._pos_dirty:
+            self._save_position_if_dirty()
+        self._drag = None
 
     def _toggle_collapse(self):
-        self._collapsed = not self._collapsed
-        if self._collapsed:
-            self.body.pack_forget()
+        self._set_collapsed(not self._collapsed, persist=True)
+
+    def _set_collapsed(self, collapsed: bool, persist: bool = False):
+        """折叠/展开。分成独立方法是为了启动时能按配置直接置位。"""
+        self._collapsed = collapsed
+        if collapsed:
+            self.scroll_wrap.pack_forget()
             self.status.pack_forget()
-            self.root.geometry(f"{W_WIDTH}x{COLLAPSED_H}")
+            self.root.geometry(f"{self.width}x{COLLAPSED_H}")
             self.collapse_btn.configure(text="▼")
             self._paint_collapsed_title()
         else:
-            body_args = dict(fill="both", expand=True, padx=12, pady=(0, 10))
-            self.body.pack(**body_args)
+            self.scroll_wrap.pack(fill="both", expand=True)
             self.status.pack(fill="x", padx=16, pady=(0, 8))
-            self.root.geometry(f"{W_WIDTH}x{self.height}")
+            self.root.geometry(f"{self.width}x{self.height}")
             self.collapse_btn.configure(text="▲")
             self.title_lbl.configure(text="二进制悬浮窗")
-        self.root.after(40, self._apply_round)
+        if persist:
+            # 记住折叠状态：用户习惯折起来只露一条，每次启动都展开很烦
+            self.cfg["collapsed"] = collapsed
+            self._save()
+        try:
+            self.root.after(40, self._apply_round)
+        except tk.TclError:
+            pass
 
     def _paint_collapsed_title(self):
-        """折叠时标题栏顺带显示译文，不展开也能看到结果。"""
+        """折叠时标题栏显示「最后一条状态」，不展开也能知道发生了什么。
+
+        之前只显示译文，没有译文时就只剩四个字「二进制悬浮窗」，等于
+        折叠状态下什么都看不到 —— 快捷键有没有生效、刚转了什么全不知道。
+        """
+        parts = []
         raw = self.result.get("1.0", "end-1c").strip()
-        if not raw or raw == PLACEHOLDER_RESULT:
-            self.title_lbl.configure(text="二进制悬浮窗")
-            return
-        text = raw.replace("\n", " ")
-        if len(text) > 22:
-            text = text[:22] + "…"
-        self.title_lbl.configure(text=f"→ {text}")
+        if raw and raw != PLACEHOLDER_RESULT:
+            text = raw.replace("\n", " ")
+            if len(text) > 18:
+                text = text[:18] + "…"
+            parts.append("→ " + text)
+        # 状态栏的最后一句话（去掉自动复位的那句通用文案）
+        try:
+            tip = self.status.cget("text")
+        except tk.TclError:
+            tip = ""
+        if tip:
+            if len(tip) > 18:
+                tip = tip[:18] + "…"
+            parts.append(tip)
+        if not parts:
+            parts.append("二进制悬浮窗")
+        self.title_lbl.configure(text=" · ".join(parts))
 
     def _cycle_alpha(self):
         steps = [1.0, 0.92, 0.8, 0.65]
@@ -596,7 +1275,7 @@ class BinFloater:
         nxt = steps[(steps.index(min(steps, key=lambda s: abs(s - cur))) + 1) % len(steps)]
         self.root.attributes("-alpha", nxt)
         self.cfg["alpha"] = nxt
-        save_config(self.cfg)
+        self._save()
         self._set_status(f"透明度 {int(nxt * 100)}%", MUTED)
 
     def _toggle_topmost(self):
@@ -605,23 +1284,47 @@ class BinFloater:
         self.pin_btn.configure(fg=TEAL if self.topmost else MUTED)
         self.pin_btn.configure(text="◉" if self.topmost else "○")
         self.cfg["topmost"] = self.topmost
-        save_config(self.cfg)
+        self._save()
         self._set_status("已置顶" if self.topmost else "已取消置顶", TEAL if self.topmost else MUTED)
 
-    def _toggle_compact(self):
-        self.compact = not self.compact
-        self.cfg["compact"] = self.compact
-        save_config(self.cfg)
-        self._paint_compact_btn()
+    # ---------- 编码格式 / 分隔符 ----------
+    def _cycle_format(self):
+        idx = core.FORMATS.index(self.fmt) if self.fmt in core.FORMATS else 0
+        self.fmt = core.FORMATS[(idx + 1) % len(core.FORMATS)]
+        self.cfg["format"] = self.fmt
+        self._save()
+        self._paint_format_btn()
         self._on_input()
+        self._set_status("编码格式改成 %s" % core.FORMAT_TEXT.get(self.fmt, self.fmt), TEAL)
 
-    def _paint_compact_btn(self):
-        self.compact_btn.configure(fg=TEAL if self.compact else MUTED,
-                                   text="紧凑 ✓" if self.compact else "紧凑")
+    def _paint_format_btn(self):
+        self.fmt_btn.configure(text=core.FORMAT_TEXT.get(self.fmt, self.fmt))
+        # 分隔符只对二进制和十六进制有意义，Base64/摩斯有自己的分隔规则
+        sep_ok = self.fmt in ("binary", "hex")
+        self.sep_btn.configure(fg=MUTED if sep_ok else "#3d4655")
+        # copy_btn 在卡片下半部分才建，首次绘制时还不存在
+        btn = getattr(self, "copy_btn", None)
+        if btn is not None:
+            btn.configure(text="复制" + core.FORMAT_TEXT.get(self.fmt, "编码"))
+
+    def _cycle_separator(self):
+        if self.fmt not in ("binary", "hex"):
+            self._set_status("%s 不需要分隔符" % core.FORMAT_TEXT.get(self.fmt, self.fmt), WARN, 4000)
+            return
+        idx = core.SEPARATORS.index(self.sep) if self.sep in core.SEPARATORS else 0
+        self.sep = core.SEPARATORS[(idx + 1) % len(core.SEPARATORS)]
+        self.cfg["separator"] = self.sep
+        self._save()
+        self._paint_separator_btn()
+        self._on_input()
+        self._set_status("分隔符改成 %s" % core.SEPARATOR_TEXT.get(self.sep, self.sep), TEAL)
+
+    def _paint_separator_btn(self):
+        self.sep_btn.configure(text=core.SEPARATOR_TEXT.get(self.sep, self.sep))
 
     def _toggle_auto_copy(self):
-        self.cfg["auto_copy"] = not self.cfg.get("auto_copy", False)
-        save_config(self.cfg)
+        self.cfg["auto_copy"] = not _as_bool(self.cfg.get("auto_copy", False), False)
+        self._save()
         self._paint_auto_btn()
         self._set_status(
             "识别到二进制后将自动把译文写回剪切板" if self.cfg["auto_copy"] else "已关闭自动回写译文",
@@ -629,9 +1332,77 @@ class BinFloater:
         )
 
     def _paint_auto_btn(self):
-        on = bool(self.cfg.get("auto_copy", False))
+        on = _as_bool(self.cfg.get("auto_copy", False), False)
         self.auto_btn.configure(fg=TEAL if on else MUTED,
                                 text="自动回写 ✓" if on else "自动回写")
+
+    # ---------- 剪切板监视开关 ----------
+    def _toggle_clip_pause(self):
+        self._clip_paused = not self._clip_paused
+        self.cfg["clip_paused"] = self._clip_paused
+        self._save()
+        self._paint_pause_btn()
+        if self._clip_paused:
+            self.clip_badge.configure(text="监视已暂停", fg=WARN)
+            self._set_status("已暂停监视剪切板，点右上角恢复", WARN, 5000)
+        else:
+            # 恢复时把基线对齐当前值，否则暂停期间的改动会一股脑涌进来
+            try:
+                self._last_seq = clipwin.sequence()
+                self._last_clip = clipwin.read_text()
+            except Exception:
+                pass
+            self._set_status("已恢复监视剪切板", TEAL, 4000)
+
+    def _paint_pause_btn(self):
+        # 用 ASCII 的 ‖ / ▶ 而不是 ⏸ / ▶ 的 emoji 变体：Tk 配微软雅黑打不出
+        # 彩色 emoji，会渲染成方块（这项目之前用 ⌖、⌄ 踩过两次）。
+        self.pause_btn.configure(
+            text="▶ 恢复" if self._clip_paused else "‖ 暂停",
+            fg=WARN if self._clip_paused else MUTED,
+        )
+
+    # ---------- 反向转换 ----------
+    def _reverse_result(self):
+        """把当前译文当原文，按相反方向再转一次。
+
+        卡在「转错了想反悔」这一步：原来得先复制译文、粘到输入框、再转回来。
+        现在一键就回去。
+        """
+        text = self.result.get("1.0", "end-1c").strip()
+        if not text or text == PLACEHOLDER_RESULT:
+            self._set_status("译文区是空的，没有可反向的内容", WARN)
+            return
+        # 译文是「解码后的文字」，反向就是把它编回去
+        out = core.encode_as(text, self.fmt, self.sep)
+        if not out:
+            self._set_status("反向转换没有产出", WARN)
+            return
+        self.result.configure(fg=TEXT)
+        self.result.set_text(out)
+        self.clip_badge.configure(
+            text="已反向 · " + core.FORMAT_TEXT.get(self.fmt, self.fmt), fg=TEAL)
+        self._push_history("encode", self.fmt, text, out)
+        self._flash_result()
+        self._set_status("已反向转换，点「复制译文」取走", TEAL, 5000)
+
+    def _paint_lock_btn(self):
+        on = self._result_locked
+        self.lock_btn.configure(fg=WARN if on else MUTED,
+                                text="已锁定" if on else "锁定")
+
+    def _toggle_result_lock(self):
+        self._result_locked = not self._result_locked
+        self._paint_lock_btn()
+        if self._result_locked:
+            self._set_status("译文已锁定，剪切板变化不再覆盖", TEAL, 4000)
+        else:
+            self._set_status("已解锁，显示最新剪切板", TEAL, 4000)
+            # 锁着的时候攒下的最新内容，解锁后补上
+            if self._pending_clip is not None:
+                pending = self._pending_clip
+                self._pending_clip = None
+                self._on_clipboard(pending)
 
     # ---------- 转换当前行 ----------
     def _paint_trigger_btn(self):
@@ -648,7 +1419,7 @@ class BinFloater:
         idx = TRIGGER_ORDER.index(self.trigger_mode)
         self.trigger_mode = TRIGGER_ORDER[(idx + 1) % len(TRIGGER_ORDER)]
         self.cfg["trigger_mode"] = self.trigger_mode
-        save_config(self.cfg)
+        self._save()
         self._paint_trigger_btn()
         self._apply_trigger_mode()
         self._paint_space_btn()
@@ -665,6 +1436,7 @@ class BinFloater:
                     self._on_hotkey_trigger, space_mode=space, hotkey_mode=hotkey,
                     hotkey=self.hotkey, on_capture=self._on_hotkey_captured,
                     space_count=self.space_count,
+                    on_capture_hint=self._on_capture_hint,
                 )
                 if not self._watcher.install():
                     self._watcher = None
@@ -720,7 +1492,7 @@ class BinFloater:
             n = trigger.SPACE_COUNT_MIN
         self.space_count = n
         self.cfg["space_count"] = n
-        save_config(self.cfg)
+        self._save()
         if self._watcher is not None:
             self._watcher.space_count = n
         self._paint_space_btn()
@@ -773,6 +1545,23 @@ class BinFloater:
         except Exception:
             pass
 
+    def _on_capture_hint(self, mods_text):
+        """钩子线程：录制中按住了哪些修饰键。同样只能入队。"""
+        try:
+            self._triggers.put_nowait(("hint", mods_text))
+        except Exception:
+            pass
+
+    def _show_capture_hint(self, mods_text):
+        """录制中实时显示「Ctrl+Alt+…」。"""
+        if not self._capturing:
+            return
+        if mods_text:
+            self.hotkey_btn.configure(text="%s + …" % mods_text, fg=WARN, bg=CARD_HI)
+            self.hotkey_hint.configure(text="再按一个主键", fg=MUTED)
+        else:
+            self._paint_hotkey_btn()
+
     def _apply_captured(self, spec):
         self._capturing = False
         if self._watcher is not None:
@@ -795,14 +1584,19 @@ class BinFloater:
         self.hotkey = parsed
         self.hotkey_spec = parsed.spec()
         self.cfg["hotkey"] = self.hotkey_spec
-        save_config(self.cfg)
+        self._save()
         self._capture_backup = None
         if self._watcher is not None:
             self._watcher.hotkey = parsed
         self._paint_hotkey_btn()
         self._refresh_tray_tooltip()
         if parsed.has_modifier():
-            self._set_status("快捷键已改为 %s" % parsed.text(), OK, 5000)
+            clash = hotkey_mod.conflict_warning(parsed)
+            if clash:
+                self._set_status("已设为 %s，但它和系统冲突：%s"
+                                 % (parsed.text(), clash), WARN, 9000)
+            else:
+                self._set_status("快捷键已改为 %s" % parsed.text(), OK, 5000)
         else:
             self._set_status("%s —— %s" % (parsed.text(), hotkey_mod.WARN_NO_MODIFIER),
                              WARN, 7000)
@@ -820,10 +1614,13 @@ class BinFloater:
         try:
             while True:
                 item = self._triggers.get_nowait()
-                # 队列里混着两种事件：转换触发（字符串）和快捷键录制结果（元组）。
+                # 队列里混着三种事件：转换触发（字符串）、快捷键录制结果
+                # 和录制中的修饰键回显（都是元组，靠第一项区分）。
                 # 用类型区分，免得以后再加事件类型时又得改一轮。
                 if isinstance(item, tuple) and item and item[0] == "capture":
                     self._apply_captured(item[1])
+                elif isinstance(item, tuple) and item and item[0] == "hint":
+                    self._show_capture_hint(item[1])
                 else:
                     self._do_convert_line(item)
         except queue.Empty:
@@ -861,43 +1658,91 @@ class BinFloater:
 
         attempt(2)
 
-    def _do_convert_line(self, kind):
+    def _convert_text(self, text):
+        """按当前方向设置把一段文字转换一次。
+
+        抽出来是因为「转换当前行」和输入框里的批量转换要走同一套判断，
+        两边各写一份迟早出现「同一个字符串在两处结果不一样」。
+        """
+        mode = self.dir_mode
+        if mode == DIR_TEXT2BIN:
+            return core.encode_as(text, self.fmt, self.sep)
+        if mode == DIR_BIN2TEXT:
+            out, _msg = core.decode_as(text, self.fmt)
+            return out or ""
+        # 自动判断：先看内容像哪种编码，像就解码，不像就编码。
+        # 格式选项为「二进制」时才允许自动换格式，否则用户明确选了
+        # 十六进制/Auto 又乱跳会莫名其妙。
+        how = core.auto_detect(text)
+        if how == "bin2text":
+            out, _msg = core.decode_as(text, core.detect_format(text) or self.fmt)
+            return out or ""
+        if how == "text2bin":
+            return core.encode_as(text, self.fmt, self.sep)
+        return ""
+
+    def _do_convert_line(self, kind, convert_selection=False):
         if not keys.IS_WINDOWS:
             self._set_status("这个功能只在 Windows 上可用", WARN)
             return
-        mode = self.dir_mode
 
         def convert(text):
-            if mode == DIR_TEXT2BIN:
-                return core.text_to_binary(text, sep="" if self.compact else " ")
-            if mode == DIR_BIN2TEXT:
-                out, _msg = core.binary_to_text(text)
-                return out or ""
-            how = core.auto_detect(text)
-            if how == "bin2text":
-                out, _msg = core.binary_to_text(text)
-                return out or ""
-            if how == "text2bin":
-                return core.text_to_binary(text, sep="" if self.compact else " ")
-            return ""
+            return self._convert_text(text)
 
         try:
-            status, src, out, msg = keys.convert_line(convert)
+            if convert_selection:
+                status, src, out, msg = keys.convert_selection(convert)
+            else:
+                status, src, out, msg = keys.convert_line(convert)
         except Exception as exc:
             self._set_status(f"转换失败：{exc}", ERR, 6000)
             return
 
         if status == "ok":
             preview = out if len(out) <= 46 else out[:46] + "…"
-            self._set_status(f"已转换 {len(src)} 字符 → {preview}", OK, 5000)
+            where = "选中内容" if convert_selection else "这一行"
+            self._set_status(f"已转换{where} {len(src)} 字符 → {preview}", OK, 5000)
         elif status == "empty":
-            self._set_status("光标前面这一行没有文字", WARN)
+            if convert_selection:
+                self._set_status(msg or "先在别的程序里选中要转换的文字，再点这里",
+                                 WARN, 6000)
+            else:
+                self._set_status(msg or "光标前面这一行没有文字", WARN, 5000)
         elif status == "same":
-            self._set_status("转换结果和原文一样，没动", MUTED)
+            # 转换前后没区别时要知道是「本来就是这样」还是「转换器报错」
+            if msg.startswith("转换出错"):
+                self._set_status(f"{msg}（当前窗口可能拿不到文字）", WARN, 6000)
+            else:
+                self._set_status(msg or "转换结果和原文一样，没动", MUTED)
         elif status == "clipfail":
-            self._set_status("写剪切板失败，可能被别的程序占着", ERR, 6000)
+            self._set_status(msg or "写剪切板失败，可能被别的程序占着", ERR, 6000)
         else:
-            self._set_status("当前窗口不支持这个操作", WARN)
+            self._set_status(msg or "当前窗口不支持这个操作", WARN)
+
+    def _convert_selection_now(self):
+        """选中一段（可以跨行）整体转换，而不是只取光标所在那一行。
+
+        和「转换这一行」的区别写在按钮旁边：这个需要用户先手动选中，
+        系统不知道光标在哪、也不去猜，没选区就什么都不动。
+        """
+        if not self._last_foreign_hwnd:
+            self._do_convert_line("button", convert_selection=True)
+            return
+
+        target = self._last_foreign_hwnd
+
+        def attempt(left):
+            if keys.focus_window(target):
+                self.root.after(120, lambda: self._do_convert_line(
+                    "button", convert_selection=True))
+                return
+            if left > 0:
+                self.root.after(60, lambda: attempt(left - 1))
+            else:
+                self._set_status("切不回刚才的窗口，请用 %s 触发"
+                                 % self.hotkey.text(), WARN, 6000)
+
+        attempt(2)
 
     def _paint_dir_btn(self):
         self.dir_btn.configure(text=DIR_TEXT.get(self.dir_mode, "自动判断"),
@@ -907,26 +1752,53 @@ class BinFloater:
         idx = DIR_ORDER.index(self.dir_mode)
         self.dir_mode = DIR_ORDER[(idx + 1) % len(DIR_ORDER)]
         self.cfg["dir_mode"] = self.dir_mode
-        save_config(self.cfg)
+        self._save()
         self._paint_dir_btn()
 
     def _bind_keys(self):
         r = self.root
-        r.bind("<Control-q>", lambda e: self._quit())
-        r.bind("<Control-b>", lambda e: self._clip_to_bin())
-        r.bind("<Escape>", lambda e: self._toggle_collapse())
+        # 全局快捷键绑在 toplevel 上，Tk 的事件会从控件冒泡到 toplevel。
+        # 于是用户在输入框里按 Ctrl+Q 会把程序关掉、按 Esc 会把窗口折叠、
+        # 按 Ctrl+B 会把剪切板内容覆盖掉 —— 全是意外。
+        # 解决办法：在入口处先看事件源，来自输入框就直接放行给输入框自己处理。
+        r.bind("<Control-q>", self._guard_text(self._quit))
+        r.bind("<Control-b>", self._guard_text(self._clip_to_bin))
+        r.bind("<Escape>", self._guard_text(self._toggle_collapse))
         self.entry.bind("<Escape>", lambda e: self.entry.selection_clear())
         # 关闭窗口时保存位置
         r.protocol("WM_DELETE_WINDOW", self._quit)
+
+    def _guard_text(self, action):
+        """把全局快捷键包一层：焦点在文本输入区时不触发，让输入框自己消化。
+
+        为什么要这么做：Tk 的 bindtags 里，控件事件处理完还会继续冒泡到
+        toplevel（'.'）。输入框本身没有绑定 Ctrl+Q，事件就一路冒到 toplevel
+        把程序关掉了。用户只是想打个字。
+        """
+        def handler(event):
+            if self._in_text_widget(event):
+                return None  # 不 return "break"，让输入框照常处理
+            action()
+            return "break"
+        return handler
+
+    def _in_text_widget(self, event) -> bool:
+        """事件是不是发生在文本输入控件上。"""
+        try:
+            w = event.widget
+        except Exception:
+            return False
+        return isinstance(w, (tk.Entry, tk.Text))
 
     def _quit(self):
         self._alive = False
         self._release_watcher()
         self._stop_tray()
+        self._stop_waker()
         try:
             self.cfg["x"] = self.root.winfo_x()
             self.cfg["y"] = self.root.winfo_y()
-            save_config(self.cfg)
+            self._save()
             self.root.destroy()
         except Exception:
             pass
@@ -952,6 +1824,22 @@ class BinFloater:
             except Exception:
                 pass
             self._tray = None
+
+    def _start_waker(self):
+        """建「另一个实例请求唤回窗口」的接收端。失败不影响主功能。"""
+        try:
+            import wakeup
+            self._waker = wakeup.Waker()
+        except Exception:
+            self._waker = None
+
+    def _stop_waker(self):
+        if self._waker is not None:
+            try:
+                self._waker.close()
+            except Exception:
+                pass
+            self._waker = None
 
     def _on_tray_event(self, kind):
         """托盘线程回调 —— 只入队，绝不碰 tkinter。"""
@@ -1001,7 +1889,7 @@ class BinFloater:
         if not self._tray_hint_shown:
             self._tray_hint_shown = True
             self.cfg["tray_hint_shown"] = True
-            save_config(self.cfg)
+            self._save()
             trig = self._trigger_text()
             if trig:
                 # 快捷键末尾是 ASCII 字母，跟后面的中文之间要留个空格；
@@ -1034,13 +1922,19 @@ class BinFloater:
         return ""
 
     def _refresh_tray_tooltip(self):
-        """托盘提示要跟着当前模式走，不能一直写快捷键。"""
+        """托盘提示要跟着当前模式走，不能一直写快捷键。
+
+        只改 self._tray.tooltip 属性没用：NIM_ADD 时系统已经拿走一份副本，
+        后面改属性不会同步过去。必须调 set_tooltip 让它发一次 NIM_MODIFY，
+        否则用户悬停看到的永远是启动时那句话。
+        """
         if self._tray is None:
             return
         try:
             trig = self._trigger_text()
-            self._tray.tooltip = (("二进制悬浮窗 · %s" % trig) if trig
-                                  else "二进制悬浮窗 · 触发已关闭")[:127]
+            text = (("二进制悬浮窗 · %s" % trig) if trig
+                    else "二进制悬浮窗 · 触发已关闭")[:127]
+            self._tray.set_tooltip(text)
         except Exception:
             pass
 
@@ -1068,6 +1962,12 @@ class BinFloater:
 
     # ---------- 状态提示 ----------
     def _set_status(self, text, color=MUTED, reset_after=4000):
+        # 同一句话反复设很常见（轮询、重绘都会顺手刷一下状态）。Tk 每次
+        # configure 都要走一遍几何重算，白费。内容和颜色都没变就直接跳过。
+        if text == self._status_text and color == self._status_color:
+            return
+        self._status_text = text
+        self._status_color = color
         try:
             self.status.configure(text=text, fg=color)
         except tk.TclError:
@@ -1083,10 +1983,26 @@ class BinFloater:
 
     def _idle_status(self):
         self._status_reset_after = None
+        self._status_text = "监视中 · 复制 0/1 串即可自动翻译"
+        self._status_color = MUTED
         try:
-            self.status.configure(text="监视中 · 复制 0/1 串即可自动翻译", fg=MUTED)
+            self.status.configure(text=self._status_text, fg=MUTED)
         except tk.TclError:
             pass
+
+    # ---------- 配置落盘 ----------
+    def _save(self, **extra):
+        """把 self.cfg 写盘。失败时明确告诉用户，不再只写日志。
+
+        之前 save_config 吞掉异常只记日志，用户改完设置在磁盘满/被安全软件
+        拦的情况下毫无察觉，下次启动发现设置没了还以为程序有 bug。
+        """
+        if extra:
+            self.cfg.update(extra)
+        if not save_config(self.cfg):
+            self._set_status("设置没能保存到磁盘，检查一下磁盘空间或安全软件", ERR, 8000)
+            return False
+        return True
 
     def _flash_result(self):
         try:
@@ -1129,43 +2045,136 @@ class BinFloater:
             return
         try:
             self._remember_foreground()
-            seq = clipwin.sequence()
-            if seq != self._last_seq:
-                self._last_seq = seq
-                text = clipwin.read_text()
-                if text and text != self._last_clip:
-                    self._last_clip = text
-                    self._on_clipboard(text)
+            # 有别的实例请求唤回窗口吗（用户又双击了一次 exe）
+            if self._waker is not None and self._waker.poll():
+                self._show_from_tray()
+            self._save_position_if_dirty()
+            if not self._clip_paused:
+                seq = clipwin.sequence()
+                if seq != self._last_seq:
+                    self._last_seq = seq
+                    text = clipwin.read_text()
+                    if text and text != self._last_clip:
+                        self._last_clip = text
+                        self._on_clipboard(text)
         except Exception as exc:  # 监视线程永不死
             self._set_status(f"读取剪切板失败：{exc}", ERR)
+        # 收进托盘后窗口根本看不见，没必要每 320ms 读一次剪切板。
+        # 拉长到 1.2s，省下来的 CPU 对笔记本续航是有意义的。
         try:
-            self.root.after(320, self._poll)
+            self.root.after(1200 if self._in_tray else 320, self._poll)
         except tk.TclError:
             pass
 
+    def _save_position_if_dirty(self):
+        """位置变了就找机会落盘。原来只在 _quit 里存，进程被强杀/崩溃就丢。
+
+        每 320ms 都写盘太浪费，位置真的变了才写，而且变了之后最多等一拍
+        就写下去——不攒着，攒着等于又回到「强杀就丢」。
+        """
+        if not self._pos_dirty:
+            return
+        try:
+            x = self.root.winfo_x()
+            y = self.root.winfo_y()
+        except tk.TclError:
+            return
+        if (x, y) == self._last_saved_pos:
+            self._pos_dirty = False
+            return
+        self._last_saved_pos = (x, y)
+        self._pos_dirty = False
+        self.cfg["x"] = x
+        self.cfg["y"] = y
+        self._save()
+
     def _on_clipboard(self, text: str):
-        if core.looks_like_binary(text):
-            decoded, msg = core.binary_to_text(text)
+        # 锁着的时候只记下最新内容，正文一个字都不动。用户正盯着译文看，
+        # 剪切板一变就把正文冲掉，等于把人家读到一半的东西抢走。
+        if self._result_locked:
+            self._pending_clip = text
+            self.clip_badge.configure(text="剪切板已变 · 译文锁定中", fg=WARN)
+            return
+        # 剪切板里的东西可能是四种编码之一，先认一下是哪种
+        fmt = core.detect_format(text)
+        if fmt:
+            decoded, msg = core.decode_as(text, fmt)
             if decoded is None:
                 self.clip_badge.configure(text="识别失败", fg=WARN)
                 self._set_status(f"{msg} · 可手动修改后再试", WARN, 6000)
                 return
             self.result.configure(fg=TEXT)
             self.result.set_text(decoded)
-            self.clip_badge.configure(text=f"已翻译 · {msg}", fg=OK)
-            self._set_status(f"检测到二进制 → 已翻译：{msg}", OK, 6000)
+            label = core.FORMAT_TEXT.get(fmt, fmt)
+            self.clip_badge.configure(text=f"{label} · {msg}", fg=OK)
+            self._set_status(f"检测到{label} → 已翻译：{msg}", OK, 6000)
+            self._clip_fmt = fmt
             self._flash_result()
+            self._push_history("decode", fmt, text, decoded)
             if self._collapsed:
                 self._paint_collapsed_title()
-            if self.cfg.get("auto_copy", False) and decoded.strip():
+            if _as_bool(self.cfg.get("auto_copy", False), False) and decoded.strip():
                 self._write_clip(decoded)
         else:
-            # 普通文字：不打断，只提示可一键转二进制
+            # 普通文字：不打断，只提示可一键转编码
+            #
+            # 角标只放固定短词，不塞内容摘要。这一行是「标题 + 角标 + 暂停」
+            # 三件并排，角标一长就把暂停键挤出窗口右边（截图里「‖ 暂停」
+            # 直接消失了）。内容摘要交给状态栏，那里有整行宽度。
+            self.clip_badge.configure(text="普通文字", fg=MUTED)
             shown = text.strip().replace("\n", " ")
-            if len(shown) > 26:
-                shown = shown[:26] + "…"
-            self.clip_badge.configure(text=f"普通文字：{shown}", fg=MUTED)
-            self._set_status("剪切板是普通文字 · 按 Ctrl+B 或点「→ 转二进制」", MUTED, 5000)
+            if len(shown) > 22:
+                shown = shown[:22] + "…"
+            self._set_status("剪切板是普通文字：%s · 按 Ctrl+B 或点「→ 转编码」"
+                             % shown, MUTED, 5000)
+            self._clip_fmt = ""
+
+    # ---------- 转换历史 ----------
+    HISTORY_MAX = 20
+
+    def _push_history(self, kind, fmt, src, out):
+        """记一条转换历史。转错了想找回上一版时用得着。
+
+        只存内存不落盘：这里可能有用户剪切板里的私人内容，写进
+        config.json 就等于永久留在磁盘上了。
+        """
+        try:
+            entry = (kind, fmt, src, out, time.strftime("%H:%M:%S"))
+            self._history.insert(0, entry)
+            del self._history[self.HISTORY_MAX:]
+            self._paint_history()
+        except Exception:
+            pass
+
+    def _paint_history(self):
+        box = getattr(self, "history_box", None)
+        if box is None:
+            return
+        try:
+            for w in box.winfo_children():
+                w.destroy()
+            if not self._history:
+                tk.Label(box, text="还没有转换记录", bg=CARD, fg="#5b6579",
+                         font=self.font_meta, anchor="w").pack(fill="x")
+                return
+            for kind, fmt, src, out, ts in self._history[:6]:
+                row = tk.Frame(box, bg=CARD)
+                row.pack(fill="x", pady=1)
+                arrow = "解码" if kind == "decode" else "编码"
+                label = "%s %s · %s" % (ts, arrow, core.FORMAT_TEXT.get(fmt, fmt))
+                tk.Label(row, text=label, bg=CARD, fg="#5b6579",
+                         font=self.font_meta, width=15, anchor="w").pack(side="left")
+                shown = out.replace("\n", " ")
+                if len(shown) > 30:
+                    shown = shown[:30] + "…"
+                lbl = tk.Label(row, text=shown, bg=CARD, fg=MUTED,
+                               font=self.font_meta, anchor="w", cursor="hand2")
+                lbl.pack(side="left", fill="x", expand=True)
+                lbl.bind("<Button-1>", lambda e, t=out: self._copy_any(t))
+                lbl.bind("<Enter>", lambda e, w=lbl: w.configure(fg=TEAL))
+                lbl.bind("<Leave>", lambda e, w=lbl: w.configure(fg=MUTED))
+        except tk.TclError:
+            pass
 
     def _write_clip(self, text: str):
         """程序自己写剪切板时登记，避免被自己的轮询再次识别。"""
@@ -1203,8 +2212,8 @@ class BinFloater:
         if not text or not text.strip():
             self._set_status("剪切板没有内容", WARN)
             return
-        self._fill_manual(text)
-        self._set_status("已把剪切板文字转成二进制", OK)
+        if not self._fill_manual(text):
+            self._set_status("已把剪切板文字转成二进制", OK)
 
     def _paste_text(self):
         text = clipwin.read_text()
@@ -1213,10 +2222,27 @@ class BinFloater:
             return
         self._fill_manual(text)
 
-    def _fill_manual(self, text: str):
+    def _fill_manual(self, text: str) -> bool:
+        """把文字填进输入框并立即转换。返回 True 表示走了「太长不进输入框」的旁路。
+
+        Entry.insert 的耗时是超线性的：实测 1 千字 0.03 秒、5 千字 0.44 秒、
+        2 万字 5.9 秒、5 万字 36 秒。拖一个几 MB 的文本文件进来会直接把
+        界面卡死（用户会以为程序崩了）。超长的就不进输入框了，直接转好
+        放在结果区——Text 控件的插入是线性的，45 万字也只要 0.03 秒。
+        """
+        if len(text) > MAX_ENTRY_CHARS:
+            self.entry.delete(0, "end")
+            self.input_var.set("")   # 会触发 _on_input 清空结果，所以放在下面赋值之前
+            self.bin_out.set_text(core.encode_as(text, self.fmt, self.sep))
+            self.len_badge.configure(text=core.describe(text))
+            self._set_status(
+                "文字太长，没放进输入框，已经直接转换好了（%s）"
+                % core.describe(text), TEAL, 7000)
+            return True
         self.entry.delete(0, "end")
         self.entry.insert(0, text.replace("\n", " "))
         self._on_input()
+        return False
 
     def _on_input(self):
         text = self.input_var.get()
@@ -1224,7 +2250,7 @@ class BinFloater:
             self.bin_out.set_text("")
             self.len_badge.configure(text="")
             return
-        out = core.text_to_binary(text, sep="" if self.compact else " ")
+        out = core.encode_as(text, self.fmt, self.sep)
         self.bin_out.set_text(out)
         self.len_badge.configure(text=core.describe(text))
 
@@ -1234,6 +2260,142 @@ class BinFloater:
             self._set_status("先输入文字", WARN)
             return
         self._copy_any(bits)
+
+    # ---------- 批量 / 文件 ----------
+    def _batch_convert(self):
+        """把剪切板里的多行文本逐行转换。
+
+        输入框是单行的，塞不进多行内容，所以批量走「从剪切板读、结果写进
+        下面那块」这条路。空行原样保留，方便和原文对照。
+        """
+        text = clipwin.read_text()
+        if not text:
+            self._set_status("剪切板没有内容，先复制几行文字", WARN)
+            return
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        out = []
+        ok = 0
+        for line in lines:
+            if not line.strip():
+                out.append("")
+                continue
+            try:
+                piece = self._convert_text(line)
+            except Exception:
+                piece = ""
+            if piece:
+                ok += 1
+                out.append(piece)
+            else:
+                out.append(line)
+        result = "\n".join(out)
+        self.bin_out.set_text(result)
+        self.len_badge.configure(text="%d 行 / 成功 %d 行" % (len(lines), ok))
+        self.batch_hint.configure(text="批量 %d 行" % len(lines))
+        self._push_history("encode" if self.dir_mode != DIR_BIN2TEXT else "decode",
+                           self.fmt, text, result)
+        self._set_status("批量转换完成：%d 行，成功 %d 行" % (len(lines), ok), OK, 5000)
+
+    def _load_from_file(self):
+        path = filedialog.askopenfilename(
+            title="选一个文本文件",
+            filetypes=[("文本文件", "*.txt *.md *.csv *.json *.log"),
+                       ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                text = fh.read()
+        except UnicodeDecodeError:
+            try:
+                with open(path, "r", encoding="gbk") as fh:
+                    text = fh.read()
+            except Exception as exc:
+                self._set_status("这个文件读不了：%s" % exc, ERR, 6000)
+                return
+        except Exception as exc:
+            self._set_status("打开文件失败：%s" % exc, ERR, 6000)
+            return
+        if not text.strip():
+            self._set_status("文件是空的", WARN)
+            return
+        # 单行文本进输入框，多行走批量
+        if "\n" in text.strip():
+            self._fill_manual(text)
+            self.batch_hint.configure(text="已读 %d 行" % text.count("\n"))
+            self._set_status("已读入文件，点「多行批量」转换", TEAL, 5000)
+        else:
+            self._fill_manual(text)
+            self._set_status("已读入文件", TEAL, 4000)
+
+    def _export_result(self):
+        """把结果区的内容存成文件。大段输出用复制粘贴太别扭。"""
+        text = self.bin_out.get("1.0", "end-1c")
+        if not text.strip():
+            self._set_status("结果区是空的，没有可导出的内容", WARN)
+            return
+        path = filedialog.asksaveasfilename(
+            title="保存结果",
+            defaultextension=".txt",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+        except Exception as exc:
+            self._set_status("写文件失败：%s" % exc, ERR, 6000)
+            return
+        self._set_status("已保存到 %s" % os.path.basename(path), OK, 5000)
+
+    def _decode_to_file(self):
+        """把二进制串解成字节，直接存成文件。
+
+        「导出结果」存的是文本（把 0/1 串原样写进 .txt），这个存的是
+        解码后的**字节**——别人发来一段二进制，还原成图片/压缩包就用它。
+        """
+        text = self.bin_out.get("1.0", "end-1c")
+        if not text.strip():
+            self._set_status("结果区是空的，没有可解码的内容", WARN, 5000)
+            return
+        # 必须先确认内容是纯 0/1：_clean_bits 只负责去分隔符和 0b 前缀，
+        # 它不会替我们挡掉别的字符。直接丢给 bits_to_bytes 的话，
+        # 结果区里但凡有个字母（手动改过、或者刚反向成了十六进制），
+        # int(x, 2) 就抛 ValueError，代码里没人接，用户点一下毫无反应。
+        bits = core._clean_bits(text)
+        if not bits:
+            self._set_status("这段内容不是二进制串，解不出字节", WARN, 5000)
+            return
+        if set(bits) - {"0", "1"}:
+            self._set_status(
+                "结果区里不是二进制串（有 0/1 以外的字符），先切到二进制格式再转换",
+                WARN, 6000)
+            return
+        data = core.bits_to_bytes(bits)
+        path = filedialog.asksaveasfilename(
+            title="解码为文件（%d 字节）" % len(data),
+            defaultextension=".bin",
+            filetypes=[("二进制文件", "*.bin"), ("图片", "*.png"),
+                       ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "wb") as fh:
+                fh.write(data)
+        except Exception as exc:
+            self._set_status("写文件失败：%s" % exc, ERR, 6000)
+            return
+        # 能认出是图片就顺手说一句，用户才知道存对了
+        head = data[:8]
+        kind = ""
+        if head.startswith(b"\x89PNG\r\n\x1a\n"):
+            kind = "（PNG 图片）"
+        elif head.startswith(b"\xff\xd8\xff"):
+            kind = "（JPEG 图片）"
+        elif head.startswith(b"PK\x03\x04"):
+            kind = "（zip 压缩包）"
+        self._set_status("已保存 %d 字节%s 到 %s"
+                         % (len(data), kind, os.path.basename(path)), OK, 6000)
 
     def _clear_manual(self):
         self.entry.delete(0, "end")

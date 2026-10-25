@@ -21,7 +21,10 @@ a = Analysis(
     # tray.py 用 ctypes 直接调 Shell_NotifyIconW，没有第三方依赖；
     # icon.ico 作为 data 带上，托盘图标从 sys._MEIPASS 里读。
     datas=[("icon.ico", ".")] if os.path.exists("icon.ico") else [],
-    hiddenimports=["clipwin", "core", "gui", "keys", "trigger", "tray", "hotkey"],
+    # wakeup 是延迟导入（在函数体里 import），PyInstaller 静态分析扫不到，
+    # 不列进来的话打包后的 exe 双击第二遍会 ImportError、唤不回窗口。
+    hiddenimports=["clipwin", "core", "gui", "keys", "trigger", "tray",
+                   "hotkey", "wakeup"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

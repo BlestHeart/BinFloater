@@ -44,6 +44,8 @@ user32.SetActiveWindow.restype = wintypes.HWND
 user32.SetFocus.argtypes = [wintypes.HWND]
 user32.SetFocus.restype = wintypes.HWND
 user32.GetFocus.restype = wintypes.HWND
+# 句柄是 64 位的，不声明 restype 会被截成 32 位 int，高地址句柄永远比不上
+user32.GetForegroundWindow.restype = wintypes.HWND
 user32.UpdateWindow.argtypes = [wintypes.HWND]
 user32.PeekMessageW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT,
                                 wintypes.UINT, wintypes.UINT]
@@ -120,11 +122,29 @@ class Target:
         time.sleep(0.3)
 
     def focus(self):
-        user32.SetForegroundWindow(self.main)
-        user32.SetActiveWindow(self.main)
-        user32.SetFocus(self.edit)
-        time.sleep(0.15)
-        return user32.GetFocus() == self.edit
+        """把焦点给 EDIT 控件，并确认窗口真的在前台。
+
+        GetFocus 只反映「本线程内的焦点控件」，窗口在后台时它照样返回 EDIT，
+        可 SendInput 是往**前台**窗口投的，窗口不在前台按键就全打歪了。
+        所以要用 GetForegroundWindow 验证，并走 keys.focus_window 的
+        前台锁定兜底（AttachThreadInput 那一套）。
+        """
+        for _ in range(6):
+            try:
+                keys.focus_window(self.main)
+            except Exception:
+                pass
+            if user32.GetForegroundWindow() != self.main:
+                time.sleep(0.12)
+                continue
+            user32.SetActiveWindow(self.main)
+            user32.SetFocus(self.edit)
+            time.sleep(0.15)
+            if (user32.GetForegroundWindow() == self.main
+                    and user32.GetFocus() == self.edit):
+                return True
+            time.sleep(0.1)
+        return False
 
     def set_text(self, text):
         buf = ctypes.create_unicode_buffer(text)
@@ -153,10 +173,40 @@ def pump(ms=200):
         time.sleep(0.006)
 
 
-def convert_pumped(convert, restore_clip=True, timeout=8.0):
-    """在后台线程跑 convert_line，主线程持续泵消息。"""
+def settle(editor, timeout=1.2):
+    """等编辑框内容稳定下来。
+
+    convert_line 里发完 Ctrl+V 后会 sleep 一小会儿再返回，但那只保证「按键发出去了」，
+    不保证目标程序已经把粘贴内容处理完。紧接着再跑一次转换，Shift+Home 可能赶在
+    上一次粘贴之前发出，抓到的就是新旧混着的半截文字——这是本测试偶发失败的唯一原因
+    （重跑三次全过，说明不是产品问题）。
+    做法：盯住内容，连续两次采样一致才算稳。
+    """
+    end = time.time() + timeout
+    prev = None
+    while time.time() < end:
+        pump(40)
+        now = editor.get_text()
+        if now == prev:
+            return now
+        prev = now
+    return prev or ""
+
+
+def convert_pumped(convert, restore_clip=True, timeout=8.0, editor=None):
+    """在后台线程跑 convert_line，主线程持续泵消息。
+
+    开跑前会重新确认一次前台：窗口刚建好时 GetForegroundWindow 已经是它，
+    但 Windows 还要走完激活流程才真正把键盘输入接过来。这中间的空档里发
+    Shift+Home，按键直接丢掉，grab_line 三次重试全落空、返回「光标这一行
+    没有文字」——偶发失败就是这么来的（约六分之一概率）。
+    """
     import threading
     box = {}
+
+    if editor is not None:
+        editor.focus()
+        pump(120)
 
     def work():
         try:
@@ -172,7 +222,10 @@ def convert_pumped(convert, restore_clip=True, timeout=8.0):
     th.join(1.0)
     if "exc" in box:
         raise box["exc"]
-    return box.get("ret", ("unsupported", "", "", "超时"))
+    ret = box.get("ret", ("unsupported", "", "", "超时"))
+    if editor is not None:
+        settle(editor)
+    return ret
 
 
 PASS = 0
@@ -218,7 +271,7 @@ def main():
         original = "你好"
         t.set_text(original)
         pump(150)
-        st, src, out, msg = convert_pumped(auto_convert)
+        st, src, out, msg = convert_pumped(auto_convert, editor=t)
         check("第 1 次（文字->二进制）状态 ok", st == "ok", "%s %s" % (st, msg))
         check("第 1 次抓到的原文正确", src == original, repr(src))
         check("第 1 次方向判定为 text2bin",
@@ -229,7 +282,7 @@ def main():
         check("第 1 次结果已粘回输入框", t.get_text() == out, repr(t.get_text()))
 
         # 光标现在在二进制末尾，再按一次应该自动转回来
-        st2, src2, out2, msg2 = convert_pumped(auto_convert)
+        st2, src2, out2, msg2 = convert_pumped(auto_convert, editor=t)
         check("第 2 次（二进制->文字）状态 ok", st2 == "ok", "%s %s" % (st2, msg2))
         check("第 2 次方向判定为 bin2text",
               core.auto_detect(src2) == "bin2text",
@@ -244,10 +297,10 @@ def main():
         t.set_text(original2)
         pump(150)
         st, src, out, msg = convert_pumped(
-            lambda s: core.text_to_binary(s, sep=""))
+            lambda s: core.text_to_binary(s, sep=""), editor=t)
         check("紧凑模式 状态 ok", st == "ok", "%s %s" % (st, msg))
         check("紧凑模式 结果无空格", " " not in out, repr(out))
-        st2, src2, out2, msg2 = convert_pumped(auto_convert)
+        st2, src2, out2, msg2 = convert_pumped(auto_convert, editor=t)
         check("紧凑模式 自动判定为 bin2text",
               core.auto_detect(src2) == "bin2text", core.auto_detect(src2))
         check("紧凑模式 还原成原话", out2 == original2, repr(out2))
@@ -256,11 +309,11 @@ def main():
         original3 = "今天天气不错我们出去走走吧"
         t.set_text(original3)
         pump(150)
-        st, src, out, msg = convert_pumped(auto_convert)
+        st, src, out, msg = convert_pumped(auto_convert, editor=t)
         check("长句 状态 ok", st == "ok", "%s %s" % (st, msg))
         check("长句 抓取完整", src == original3,
               "%r vs %r" % (src, original3))
-        st2, src2, out2, msg2 = convert_pumped(auto_convert)
+        st2, src2, out2, msg2 = convert_pumped(auto_convert, editor=t)
         check("长句 还原成原话", out2 == original3, repr(out2))
 
     finally:

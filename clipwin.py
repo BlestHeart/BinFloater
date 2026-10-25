@@ -129,3 +129,60 @@ def round_window(hwnd: int, width: int, height: int, radius: int = 14) -> None:
             _user32.SetWindowRgn(hwnd, region, True)
     except Exception:
         pass
+
+
+# 拖放相关。Tkinter 自己不做文件拖放，得走 Win32 的 WM_DROPFILES：
+# 先 DragAcceptFiles 声明接收，用户拖进来时系统把这个消息递给窗口过程。
+# 注意这几个函数在 shell32 里，不在 user32（猜错会 AttributeError）。
+WM_DROPFILES = 0x0233
+
+if IS_WINDOWS:
+    _shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    _shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+    _shell32.DragAcceptFiles.restype = None
+    _shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT,
+                                        ctypes.c_wchar_p, wintypes.UINT]
+    _shell32.DragQueryFileW.restype = wintypes.UINT
+    _shell32.DragFinish.argtypes = [wintypes.HANDLE]
+    _shell32.DragFinish.restype = None
+
+
+def accept_dropped_files(hwnd: int) -> bool:
+    """声明这个窗口接受文件拖放。"""
+    if not IS_WINDOWS or not hwnd:
+        return False
+    try:
+        _shell32.DragAcceptFiles(wintypes.HWND(hwnd), True)
+        return True
+    except Exception:
+        return False
+
+
+def read_dropped_files(hdrop) -> list:
+    """从 WM_DROPFILES 的句柄里取出文件路径列表。
+
+    调用方在窗口过程里拿到 wParam 后传进来。释放（DragFinish）在这里代做，
+    因为这个句柄除了取路径没有别的用处，漏掉就泄漏了。
+    """
+    if not IS_WINDOWS or not hdrop:
+        return []
+    files = []
+    try:
+        # 第一参数传 0xFFFFFFFF 时返回文件个数
+        count = _shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
+        for i in range(int(count or 0)):
+            need = _shell32.DragQueryFileW(hdrop, i, None, 0)
+            if not need:
+                continue
+            buf = ctypes.create_unicode_buffer(int(need) + 1)
+            _shell32.DragQueryFileW(hdrop, i, buf, int(need) + 1)
+            if buf.value:
+                files.append(buf.value)
+    except Exception:
+        files = []
+    finally:
+        try:
+            _shell32.DragFinish(wintypes.HANDLE(hdrop))
+        except Exception:
+            pass
+    return files

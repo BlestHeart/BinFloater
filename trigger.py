@@ -101,9 +101,14 @@ class KeyboardWatcher:
     """
 
     def __init__(self, on_trigger, space_mode=True, hotkey_mode=True,
-                 hotkey=None, on_capture=None, space_count=None):
+                 hotkey=None, on_capture=None, space_count=None,
+                 on_capture_hint=None):
         self.on_trigger = on_trigger
         self.on_capture = on_capture
+        # 录制过程中实时回报「现在按住的是哪几个修饰键」，界面拿它显示
+        # 「Ctrl+Alt+…」让用户知道自己按到哪了。没有这个回调就只能干等，
+        # 用户不确定是不是键没按下。
+        self.on_capture_hint = on_capture_hint
         # 两个开关独立：关掉的那个绝不能吞按键，否则用户会莫名其妙丢空格。
         self.space_mode = space_mode
         self.hotkey_mode = hotkey_mode
@@ -117,6 +122,9 @@ class KeyboardWatcher:
         self._last_space = 0.0
         # 已经连按了几下空格。到 space_count 就触发。
         self._space_streak = 0
+        # 当前仍按住的键。按住不放时系统会持续发 KEYDOWN（自动重复），
+        # 不去重的话按住 Ctrl+Alt+B 会连着触发十几次转换。
+        self._held = set()
 
     def install(self) -> bool:
         if not IS_WINDOWS or self._hook:
@@ -155,6 +163,10 @@ class KeyboardWatcher:
                 if not (info.flags & LLKHF_INJECTED):
                     if self._on_key(int(info.vkCode)):
                         return 1  # 吞掉这个按键，别让它落到目标程序里
+            elif w_param in (WM_KEYUP, WM_SYSKEYUP):
+                info = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                # 记下这个键已经松开，下一次按下才允许再次触发
+                self._release(int(info.vkCode))
         except Exception:
             pass
         return _user32.CallNextHookEx(self._hook, n_code, w_param, l_param)
@@ -163,11 +175,23 @@ class KeyboardWatcher:
         """当前正被按住的修饰键集合。"""
         return set(hk.describe_mods_from_state(self._down))
 
+    def _release(self, vk: int) -> None:
+        """标记某个键已松开。钩子回调和单元测试都走这里。"""
+        self._held.discard(vk)
+
     def _on_key(self, vk: int) -> bool:
         """返回 True 表示这个按键要吞掉。"""
         # 录制模式优先：这时所有按键都用来组成新快捷键，绝不触发转换
         if self.capture_mode:
             return self._on_key_capture(vk)
+
+        # 自动重复去抖：按住一个键不放，系统会一直发 KEYDOWN。真实的第二次
+        # 「按下」必须发生在松开之后，所以这里看到重复的 vkCode 就直接跳过。
+        # 空格特别处理：连按 N 下靠的就是「按下-松开-按下」，如果不去重，
+        # 按住空格会一口气凑满 streak 直接触发。
+        if vk in self._held:
+            return False
+        self._held.add(vk)
 
         now = time.time()
         if vk == VK_SPACE and self.space_mode:
@@ -210,6 +234,15 @@ class KeyboardWatcher:
         if vk == VK_ESCAPE and not mods:
             self.on_capture("")
             return True
+
+        # 实时回显：按住修饰键时告诉界面「现在有 Ctrl+Alt」。
+        # 回调在系统钩子线程里，界面那边必须自己入队再回主线程。
+        if self.on_capture_hint is not None:
+            try:
+                self.on_capture_hint("+".join(
+                    hk.MOD_TEXT[m] for m in hk.MOD_ORDER if m in mods))
+            except Exception:
+                pass
 
         # 修饰键本身不构成快捷键，等主键按下来
         if vk in hk.MODIFIER_VKS:

@@ -42,25 +42,36 @@ python -m PyInstaller build_onedir.spec --noconfirm --clean
 ## 测试
 
 ```bash
-python tests/test_all.py       # 75 项：编解码 + 触发逻辑 + 快捷键解析 + 源码约定
-python tests/test_config.py    # 18 项：配置原子写盘、坏文件备份、错误日志
-python tests/smoke_gui.py      # 51 项：真建窗口，检查控件、钩子、托盘状态、启动回显
-python tests/e2e_convert.py    # 17 项：真 Win32 窗口，真按键、真粘贴
+python tests/test_all.py       # 120 项：编解码四种格式 + 格式识别 + 触发逻辑 + 快捷键解析 + 源码约定
+python tests/test_config.py    # 44 项：配置原子写盘、坏文件备份、类型校验、错误日志
+python tests/smoke_gui.py      # 142 项：真建窗口，控件、钩子、托盘、历史、滑块、录制回显、长文本保护
+python tests/e2e_convert.py    # 23 项：真 Win32 窗口，真按键、真粘贴、选区边界
 python tests/e2e_notepad.py    #  9 项：开真记事本，验证剪切板还原
 python tests/e2e_roundtrip.py  # 18 项：文字 → 二进制 → 文字 往返（含超长会换行的）
 ```
 
-`e2e_*.py` 会真的动键盘和剪切板，跑之前先把正在编辑的东西存一下。
+合计 356 项。`e2e_*.py` 会真的动键盘和剪切板，跑之前先把正在编辑的东西存一下。
 
 `smoke_gui.py` 会把 `APPDATA` 指到临时目录再建窗口，否则测试会把
 `tray_hint_shown`、`space_count` 之类的状态写进你真实的 `config.json`，
 导致「第一次收进托盘时弹提示」这种一次性的行为永远看不到。
 
+`e2e_*` 里的 `convert_pumped` 有三处防抖，都是踩出来的，别随手删：
+
+1. `editor.focus()` + 等 120ms：窗口刚建好时 `GetForegroundWindow` 已经返回它，
+   但系统还没走完激活流程，这中间发的按键会丢。
+2. `settle()`：`convert_line` 里 `Ctrl+V` 后只 sleep 一小会儿，那只保证按键
+   发出去了，不保证目标程序处理完。要连续两次读到一样的内容才算稳。
+3. `Target.focus()` 用 `GetForegroundWindow() == main and GetFocus() == edit`
+   双重确认，且 `GetForegroundWindow.restype` 必须声明成 `HWND`（64 位句柄
+   不声明会被截成 32 位 int，高地址句柄永远比不上）。
+
 ## 配置怎么存的
 
 `%APPDATA%\BinFloater\config.json`，纯 JSON，键很少（`trigger_mode`、
-`space_count`、`hotkey`、`dir_mode`、`x`、`y`、`alpha`、`topmost`、
-`compact`、`auto_copy`、`tray_hint_shown`）。改动即时落盘，不等退出。
+`space_count`、`hotkey`、`dir_mode`、`format`、`separator`、`x`、`y`、
+`alpha`、`topmost`、`auto_copy`、`clip_paused`、`collapsed`、`width`、
+`first_run_done`、`tray_hint_shown`）。改动即时落盘，不等退出。
 
 三个地方是特意这么写的：
 

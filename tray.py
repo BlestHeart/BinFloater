@@ -22,6 +22,9 @@ IS_WINDOWS = os.name == "nt"
 WM_APP = 0x8000
 WM_TRAYICON = WM_APP + 1
 WM_TRAY_NOTIFY = WM_APP + 2
+# 改悬停提示。单独一个消息而不是跟气泡通知共用：气泡通知改的是 szInfo，
+# 这个改的是 szTip，两者 uFlags 不同，混在一起容易互相盖掉。
+WM_TRAY_TIP = WM_APP + 3
 WM_CLOSE = 0x0010
 WM_DESTROY = 0x0002
 WM_COMMAND = 0x0111
@@ -238,6 +241,24 @@ class TrayIcon:
             self._pending_notify = None
             return False
 
+    # ---------- 悬停提示 ----------
+    def set_tooltip(self, text: str) -> bool:
+        """改托盘图标的悬停提示。任意线程可调。
+
+        只改 self.tooltip 属性是不够的：NIM_ADD 时把 szTip 交给系统之后，
+        系统手里存的是当时那一份副本，后面改属性不会自己同步过去。必须再发
+        一次 NIM_MODIFY 把新文案推过去，否则用户悬停看到的永远是启动时那句。
+        """
+        if not IS_WINDOWS or not self._hwnd:
+            return False
+        text = (text or "")[:127]
+        self.tooltip = text
+        try:
+            _user32.PostMessageW(self._hwnd, WM_TRAY_TIP, 0, 0)
+            return True
+        except Exception:
+            return False
+
     # ---------- 内部 ----------
     def _run(self):
         try:
@@ -351,6 +372,18 @@ class TrayIcon:
         except Exception:
             pass
 
+    def _update_tip(self):
+        """把当前 self.tooltip 推给系统。必须在托盘线程里调（有 _hwnd 才有效）。"""
+        if not self._hwnd:
+            return
+        nid = self._nid()
+        nid.uFlags = NIF_TIP
+        nid.szTip = self.tooltip
+        try:
+            _shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
+        except Exception:
+            pass
+
     def _popup_menu(self):
         try:
             menu = _user32.CreatePopupMenu()
@@ -394,6 +427,9 @@ class TrayIcon:
                 return 0
             if msg == WM_TRAY_NOTIFY:
                 self._show_balloon()
+                return 0
+            if msg == WM_TRAY_TIP:
+                self._update_tip()
                 return 0
             if msg == WM_COMMAND:
                 cmd = wparam & 0xFFFF

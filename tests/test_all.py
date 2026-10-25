@@ -63,8 +63,34 @@ class TestCore(unittest.TestCase):
         self.assertFalse(core.looks_like_binary("hello world"))
 
     def test_looks_like_binary_rejects_huge(self):
-        # 超过 20000 字符直接判否，避免误伤大段文本
-        self.assertFalse(core.looks_like_binary("01" * 20000))
+        # 超过 MAX_BINARY_CHARS 才判否。这个上限纯粹是防超大文本卡界面用的，
+        # 不是判定规则：早先定 20000，结果 750 个汉字转出来的位串就有 20249 字符，
+        # 再按一次快捷键时认不出这是二进制，「按两次转回来」在长文本上直接失效。
+        self.assertTrue(core.looks_like_binary("01" * 20000))
+        self.assertFalse(core.looks_like_binary("01" * (core.MAX_BINARY_CHARS // 2 + 1)))
+
+    def test_roundtrip_long_text_still_detected(self):
+        # 回归：长文本转成二进制后必须还能被 auto_detect 认成二进制
+        src = "今天天气不错我们出去走走吧" * 60  # 780 字符
+        bits = core.text_to_binary(src, sep=" ")
+        self.assertGreater(len(bits), 20000)
+        self.assertTrue(core.looks_like_binary(bits))
+        self.assertEqual(core.auto_detect(bits), "bin2text")
+        self.assertEqual(core.binary_to_text(bits)[0], src)
+
+    def test_latin1_fallback_is_flagged(self):
+        # latin-1 永远不会解码失败，任何字节都能「成功」转出字符串。
+        # 这时必须明说结果可能不可信，否则用户看到乱码而界面报「已解码 N 字节」。
+        text, msg = core.binary_to_text("11111111 11111111")
+        self.assertIsNotNone(text)
+        self.assertIn("乱码", msg)
+
+    def test_control_chars_are_escaped(self):
+        # NUL 这类字符能进字符串但显示出来什么都没有，要转成可见的 \x00
+        text, _msg = core.binary_to_text("00000000 01001000 01101001")
+        self.assertIsNotNone(text)
+        self.assertIn("\\x00", text)
+        self.assertIn("Hi", text)
 
     def test_binary_to_text_pads_tail(self):
         # 位数不是 8 的倍数时末尾补 0，不该抛异常
@@ -94,6 +120,256 @@ class TestCore(unittest.TestCase):
         self.assertEqual(core.binary_to_hex("01101000"), "68")
 
 
+class TestCodecs(unittest.TestCase):
+    """十六进制 / Base64 / 摩斯码三种新编码，以及分隔符预设。"""
+
+    # ---- 十六进制 ----
+    def test_hex_round_trip(self):
+        for text in ("hi", "你好Hi", "abc 123"):
+            enc = core.encode_as(text, "hex")
+            back, msg = core.decode_as(enc, "hex")
+            self.assertEqual(back, text, "hex 往返失败: %r -> %r (%s)" % (text, back, msg))
+
+    def test_hex_empty_stays_empty(self):
+        # 空文本编出来是空串，解空串返回 None 是合理的（提示「内容是空的」）
+        self.assertEqual(core.encode_as("", "hex"), "")
+        self.assertIsNone(core.decode_as("", "hex")[0])
+
+    def test_hex_uppercase_two_digits(self):
+        self.assertEqual(core.text_to_hex("hi"), "68 69")
+
+    def test_hex_accepts_prefix_and_separators(self):
+        # 0x 前缀、冒号、短横线、下划线、逗号都该能吃
+        for s in ("48 69", "0x48 0x69", "48:69", "48-69", "48_69", "48,69"):
+            self.assertEqual(core.hex_to_text(s)[0], "Hi", "解析不了: %r" % s)
+
+    def test_hex_rejects_odd_length(self):
+        text, msg = core.hex_to_text("486")
+        self.assertIsNone(text)
+        self.assertIn("奇数", msg)
+
+    def test_hex_rejects_bad_char(self):
+        text, msg = core.hex_to_text("48 6G")
+        self.assertIsNone(text)
+        self.assertIn("非十六进制", msg)
+
+    def test_hex_rejects_empty(self):
+        self.assertIsNone(core.hex_to_text("")[0])
+        self.assertIsNone(core.hex_to_text("   ")[0])
+
+    def test_looks_like_hex(self):
+        self.assertTrue(core.looks_like_hex("48 69"))
+        self.assertTrue(core.looks_like_hex("0x48 0x69"))
+        self.assertTrue(core.looks_like_hex("48:69:6a"))
+        # 这些不该被判成十六进制
+        self.assertFalse(core.looks_like_hex("2024"))
+        self.assertFalse(core.looks_like_hex("hello"))
+        self.assertFalse(core.looks_like_hex("4869"))
+        # `deadbeef` 字面上是合法的 `de ad be ef`，但解出来是 4 个非法
+        # UTF-8 字节。只查字符集的话用户随手复制个英文单词（DeadBeef、
+        # A1B2C3D4、build2024x）就会跳一屏乱码，所以加了一道「解出来
+        # 得像给人看的文字」的关，它过不了。
+        self.assertFalse(core.looks_like_hex("deadbeef"))
+
+    # ---- Base64 ----
+    def test_base64_round_trip(self):
+        for text in ("hi", "你好Hi", "abc 123"):
+            enc = core.encode_as(text, "base64")
+            back, msg = core.decode_as(enc, "base64")
+            self.assertEqual(back, text, "base64 往返失败: %r (%s)" % (back, msg))
+
+    def test_base64_known_value(self):
+        self.assertEqual(core.text_to_base64("Hello"), "SGVsbG8=")
+
+    def test_base64_urlsafe_accepted(self):
+        # URL-safe 变体用 - 和 _，得能认出来
+        self.assertEqual(core.base64_to_text("5L2g5aW9")[0], "你好")
+
+    def test_base64_missing_padding(self):
+        # 少了末尾的 = 也该能解（用户手抄时经常会漏）
+        self.assertEqual(core.base64_to_text("SGVsbG8")[0], "Hello")
+
+    def test_base64_rejects_plain_words(self):
+        self.assertFalse(core.looks_like_base64("hello"))
+        self.assertFalse(core.looks_like_base64("helloworld"))
+        self.assertFalse(core.looks_like_base64("hello world"))
+
+    def test_base64_rejects_hex_prefix(self):
+        # 「0x48 0x69」去分隔符后每个字符都在 Base64 字符集里，别误判
+        self.assertFalse(core.looks_like_base64("0x48 0x69"))
+
+    def test_base64_accepts_real_ones(self):
+        self.assertTrue(core.looks_like_base64("SGVsbG8="))
+        self.assertTrue(core.looks_like_base64("5L2g5aW9SGk="))
+
+    # ---- 摩斯码 ----
+    def test_morse_round_trip_ascii(self):
+        enc = core.encode_as("SOS hi", "morse")
+        self.assertEqual(enc, "... --- ... / .... ..")
+        back, msg = core.decode_as(enc, "morse")
+        self.assertEqual(back, "SOS HI", "摩斯往返失败 (%s)" % msg)
+
+    def test_morse_chinese_becomes_placeholder(self):
+        # 中文没有摩斯码，编成 ? 占位，解码回到 ?，用户能看出丢了哪个字
+        enc = core.encode_as("你好Hi", "morse")
+        self.assertIn("?", enc)
+        back, _msg = core.decode_as(enc, "morse")
+        self.assertEqual(back, "??HI")
+
+    def test_morse_accepts_unicode_dots_and_dashes(self):
+        # 用户可能用「·」和「—」手打摩斯码
+        self.assertEqual(core.morse_to_text("··· ––– ···")[0], "SOS")
+
+    def test_morse_uppercases(self):
+        # 摩斯本身不分大小写，解出来一律大写
+        self.assertEqual(core.morse_to_text(".... . .-.. .-.. ---")[0], "HELLO")
+
+    def test_morse_rejects_bad_char(self):
+        text, msg = core.morse_to_text("... xyz")
+        self.assertIsNone(text)
+        self.assertIn("非摩斯码", msg)
+
+    def test_morse_rejects_empty(self):
+        self.assertIsNone(core.morse_to_text("")[0])
+
+    def test_looks_like_morse(self):
+        self.assertTrue(core.looks_like_morse(".... .."))
+        self.assertTrue(core.looks_like_morse("... --- ..."))
+        self.assertTrue(core.looks_like_morse("? .... .."))
+        self.assertFalse(core.looks_like_morse("-"))
+        self.assertFalse(core.looks_like_morse("hello"))
+
+    # ---- 分隔符预设 ----
+    def test_separator_presets(self):
+        self.assertEqual(core.encode_as("hi", "binary", "space"), "01101000 01101001")
+        self.assertEqual(core.encode_as("hi", "binary", "comma"), "01101000, 01101001")
+        self.assertEqual(core.encode_as("hi", "binary", "newline"), "01101000\n01101001")
+        self.assertEqual(core.encode_as("hi", "binary", "none"), "0110100001101001")
+        self.assertEqual(core.encode_as("hi", "binary", "0b"), "0b01101000 0b01101001")
+
+    def test_separator_round_trip(self):
+        # 每种分隔符编出来的串都得能解回去
+        for sep in core.SEPARATORS:
+            enc = core.encode_as("hi", "binary", sep)
+            back, msg = core.decode_as(enc, "binary")
+            self.assertEqual(back, "hi", "分隔符 %s 往返失败 (%s)" % (sep, msg))
+
+    def test_separator_fallback(self):
+        # 配置里写了个不认识的名字，退回空格而不是崩
+        self.assertEqual(core.separator_for("nonsense"), " ")
+        self.assertEqual(core.encode_as("hi", "binary", "nonsense"), "01101000 01101001")
+
+    def test_separator_registry_complete(self):
+        # 每个分隔符都要有显示名，界面上才能画出来
+        for name in core.SEPARATORS:
+            self.assertIn(name, core.SEPARATOR_TEXT)
+
+    def test_format_registry_complete(self):
+        for name in core.FORMATS:
+            self.assertIn(name, core.FORMAT_TEXT)
+
+    # ---- 格式识别 ----
+    def test_detect_format(self):
+        self.assertEqual(core.detect_format("01001000 01101001"), "binary")
+        self.assertEqual(core.detect_format("48 69"), "hex")
+        self.assertEqual(core.detect_format("0x48 0x69"), "hex")
+        self.assertEqual(core.detect_format(core.text_to_hex("Hello")), "hex")
+        self.assertEqual(core.detect_format("SGVsbG8="), "base64")
+        self.assertEqual(core.detect_format(".... .."), "morse")
+        # 普通文字认不出格式
+        self.assertEqual(core.detect_format("hello world"), "")
+        self.assertEqual(core.detect_format("2024"), "")
+        self.assertEqual(core.detect_format(""), "")
+        # `deadbeef` 也是 `de ad be ef` 的写法，但它解出来不是 UTF-8，
+        # 而且更像人随手打的英文，宁可认不出也不跳一屏乱码
+        self.assertEqual(core.detect_format("deadbeef"), "")
+
+    def test_detect_format_rejects_lookalike_words(self):
+        """普通英文单词不能被当成 Base64 / 十六进制。
+
+        这是真踩过的坑：`HelloWorld`、`password123`、`Supercalifragilistic`
+        全在 Base64 的字符集里，`DeadBeef`、`A1B2C3D4`、`2024-01-01` 全是
+        合法的十六进制字符。早先只查字符集，用户随手复制个单词就跳出一屏
+        乱码。现在多一道「真解一遍，解出来得像给人看的文字」的关。
+        """
+        for word in ("HelloWorld", "Congratulations", "abcdefgh",
+                     "Supercalifragilistic", "test1234", "DeadBeef",
+                     "12345678901234567890", "A1B2C3D4", "ThisIsATest",
+                     "password123", "ABCD1234EFGH5678", "order20240115",
+                     "Cancel123", "build2024x", "2024-01-01", "12:30:45",
+                     "1,234,567", "AA:BB:CC:DD", "ab-cd-ef", "Mr. Smith"):
+            self.assertEqual(core.detect_format(word), "",
+                             "误判成编码了: %r" % word)
+
+    def test_detect_format_short_base64_with_padding(self):
+        """带 = 填充的短 Base64 要认得出来，包括只有一个字符的。
+
+        `YQ==` 是字母 a 的 Base64。尾部那个 = 是普通英文单词不会有的，
+        所以它比长度门槛更可靠。
+        """
+        self.assertEqual(core.detect_format("YQ=="), "base64")
+        self.assertEqual(core.decode_as("YQ==", "base64")[0], "a")
+        self.assertEqual(core.detect_format("SGk="), "base64")
+        self.assertEqual(core.detect_format(core.text_to_base64("Hi")), "base64")
+
+    def test_all_formats_roundtrip_through_detect(self):
+        """四种格式编码后都要能被认出并解回原文。
+
+        摩斯码只测大写：国际码表没有小写字母码，`text_to_morse` 会先转大写，
+        所以 `Hi` 进、`HI` 出——这是码表本身的限制，不是 bug。
+        摩斯也不测中文：码表里没有中文码，只能编成 ? 占位，
+        那条路径由 `test_morse_chinese_placeholder_roundtrip` 单独覆盖。
+        """
+        for fmt in core.FORMATS:
+            seps = core.SEPARATORS if fmt == "binary" else ("space",)
+            texts = ("HI", "HELLO WORLD", "TEST 123") if fmt == "morse" \
+                else ("Hi", "hello world", "test 123")
+            for sep in seps:
+                for txt in texts:
+                    enc = core.encode_as(txt, fmt, sep)
+                    self.assertEqual(core.detect_format(enc), fmt,
+                                     "%s/%s 没认出来: %r" % (fmt, sep, enc))
+                    got = core.decode_as(enc, fmt)[0]
+                    self.assertEqual(got, txt, "%s/%s 往返失败" % (fmt, sep))
+
+    def test_morse_chinese_placeholder_roundtrip(self):
+        """中文编成摩斯是 ? 占位，但这个结果必须还能被认出是摩斯码。
+
+        「你好」→ `? ?`，一个点划都没有。早先 looks_like_morse 只数点划，
+        这种串认不出来，用户转过去就再也转不回来了。
+        连单个汉字都要能回来：「你」→ `?` 也认。
+        """
+        enc = core.text_to_morse("你好")
+        self.assertEqual(enc, "? ?")
+        self.assertEqual(core.detect_format(enc), "morse")
+        got, msg = core.morse_to_text(enc)
+        self.assertEqual(got, "??")
+        self.assertIn("码表里没有", msg)
+        # 单个汉字也不能漏
+        self.assertEqual(core.text_to_morse("你"), "?")
+        self.assertEqual(core.detect_format("?"), "morse")
+        self.assertEqual(core.decode_as("?", "morse")[0], "?")
+
+    def test_morse_rejects_repeated_symbols(self):
+        """日常输入里的 `...` `---` 不能被当成摩斯码。
+
+        `...` 解出来是 SSS，`---` 解出来是 O。用户随手打个省略号或者
+        一条分隔线，剪切板里就跳出一个「解码结果」，很闹。
+        """
+        for junk in ("...", "---", "....", "----", "..", "--"):
+            self.assertEqual(core.detect_format(junk), "",
+                             "误判成摩斯码了: %r" % junk)
+        # 带空格或混合的就还是摩斯（这些是正常的码）
+        self.assertEqual(core.detect_format(". . ."), "morse")
+        self.assertEqual(core.detect_format(".... .."), "morse")
+
+    def test_auto_detect_covers_all_formats(self):
+        for enc in ("01001000 01101001", "48 69", "SGVsbG8=", ".... .."):
+            self.assertEqual(core.auto_detect(enc), "bin2text", "没认出来: %r" % enc)
+        self.assertEqual(core.auto_detect("hello"), "text2bin")
+        self.assertEqual(core.auto_detect(""), "unknown")
+
+
 def _only(*vks):
     """返回一个 _down 替身：只有列出的虚拟键算按住。
 
@@ -105,14 +381,26 @@ def _only(*vks):
 
 
 class TestTriggerLogic(unittest.TestCase):
-    """空格连按 / 快捷键的状态机。直接调 _on_key，不需要真的装钩子。"""
+    """空格连按 / 快捷键的状态机。直接调 _on_key，不需要真的装钩子。
+
+    注意：_on_key 现在带自动重复去抖——同一个键没松开之前再收到 KEYDOWN
+    会被忽略（按住不放时系统会一直发）。所以这里每次按完都补一次 _release，
+    模拟真实的「按下-松开」。
+    """
 
     def setUp(self):
         self.fired = []
         self.w = trigger.KeyboardWatcher(lambda kind: self.fired.append(kind))
 
     def _space(self):
-        return self.w._on_key(trigger.VK_SPACE)
+        r = self.w._on_key(trigger.VK_SPACE)
+        self.w._release(trigger.VK_SPACE)
+        return r
+
+    def _press(self, vk):
+        r = self.w._on_key(vk)
+        self.w._release(vk)
+        return r
 
     def test_single_space_does_not_fire(self):
         self.assertFalse(self._space())
@@ -196,6 +484,13 @@ class TestSpaceCount(unittest.TestCase):
         w._down = lambda vk: False
         return w
 
+    @staticmethod
+    def _press(w, vk):
+        """按一下再松开。_on_key 有自动重复去抖，不松开的话第二下会被忽略。"""
+        r = w._on_key(vk)
+        w._release(vk)
+        return r
+
     def test_default_is_two(self):
         w = self._mk(None)
         self.assertEqual(w.space_count, trigger.SPACE_COUNT_DEFAULT)
@@ -211,48 +506,76 @@ class TestSpaceCount(unittest.TestCase):
 
     def test_one_press_fires_when_set_to_one(self):
         w = self._mk(1)
-        self.assertTrue(w._on_key(trigger.VK_SPACE))
+        self.assertTrue(self._press(w, trigger.VK_SPACE))
         self.assertEqual(self.fired, ["space"])
 
     def test_three_presses_needed_when_set_to_three(self):
         w = self._mk(3)
-        self.assertFalse(w._on_key(trigger.VK_SPACE))
-        self.assertFalse(w._on_key(trigger.VK_SPACE))
+        self.assertFalse(self._press(w, trigger.VK_SPACE))
+        self.assertFalse(self._press(w, trigger.VK_SPACE))
         self.assertEqual(self.fired, [])
-        self.assertTrue(w._on_key(trigger.VK_SPACE))
+        self.assertTrue(self._press(w, trigger.VK_SPACE))
         self.assertEqual(self.fired, ["space"])
 
     def test_four_presses_needed_when_set_to_four(self):
         w = self._mk(4)
         for _ in range(3):
-            self.assertFalse(w._on_key(trigger.VK_SPACE))
-        self.assertTrue(w._on_key(trigger.VK_SPACE))
+            self.assertFalse(self._press(w, trigger.VK_SPACE))
+        self.assertTrue(self._press(w, trigger.VK_SPACE))
         self.assertEqual(self.fired, ["space"])
 
     def test_streak_resets_after_fire(self):
         # 触发之后要重新数，不能第四下又立刻触发
         w = self._mk(3)
-        w._on_key(trigger.VK_SPACE)
-        w._on_key(trigger.VK_SPACE)
-        self.assertTrue(w._on_key(trigger.VK_SPACE))
+        self._press(w, trigger.VK_SPACE)
+        self._press(w, trigger.VK_SPACE)
+        self.assertTrue(self._press(w, trigger.VK_SPACE))
         self.assertEqual(self.fired, ["space"])
-        self.assertFalse(w._on_key(trigger.VK_SPACE))
+        self.assertFalse(self._press(w, trigger.VK_SPACE))
         self.assertEqual(self.fired, ["space"])
 
     def test_other_key_resets_streak(self):
         w = self._mk(3)
-        w._on_key(trigger.VK_SPACE)
-        w._on_key(trigger.VK_SPACE)
-        w._on_key(0x41)  # 打了个 A
-        self.assertFalse(w._on_key(trigger.VK_SPACE))
+        self._press(w, trigger.VK_SPACE)
+        self._press(w, trigger.VK_SPACE)
+        self._press(w, 0x41)  # 打了个 A
+        self.assertFalse(self._press(w, trigger.VK_SPACE))
         self.assertEqual(self.fired, [])
 
     def test_too_slow_resets_streak(self):
         w = self._mk(3)
-        w._on_key(trigger.VK_SPACE)
+        self._press(w, trigger.VK_SPACE)
         w._last_space -= (trigger.DOUBLE_SPACE_MS + 100) / 1000.0
-        self.assertFalse(w._on_key(trigger.VK_SPACE))
+        self.assertFalse(self._press(w, trigger.VK_SPACE))
         self.assertEqual(self.fired, [])
+
+    # --- 自动重复去抖（P1-2）---
+    def test_held_space_does_not_fire(self):
+        # 按住空格不放，系统会一直发 KEYDOWN。真实的「第二下」必须发生在
+        # 松开之后，否则按住空格就会直接触发转换。
+        w = self._mk(2)
+        self.assertFalse(w._on_key(trigger.VK_SPACE))
+        for _ in range(20):
+            self.assertFalse(w._on_key(trigger.VK_SPACE))
+        self.assertEqual(self.fired, [])
+
+    def test_release_allows_next_press(self):
+        w = self._mk(2)
+        self.assertFalse(w._on_key(trigger.VK_SPACE))
+        w._release(trigger.VK_SPACE)
+        self.assertTrue(w._on_key(trigger.VK_SPACE))
+        self.assertEqual(self.fired, ["space"])
+
+    def test_held_hotkey_fires_once(self):
+        # 按住 Ctrl+Alt+B 不放，自动重复不该连着触发十几次
+        self.fired = []
+        w = trigger.KeyboardWatcher(lambda kind: self.fired.append(kind),
+                                    space_mode=False, hotkey_mode=True)
+        w._down = _only(hotkey_mod.VK_CONTROL, hotkey_mod.VK_MENU)
+        self.assertTrue(w._on_key(trigger.VK_B))
+        for _ in range(10):
+            self.assertFalse(w._on_key(trigger.VK_B))
+        self.assertEqual(self.fired, ["hotkey"])
 
 
 class TestHotkeyCapture(unittest.TestCase):
@@ -325,6 +648,23 @@ class TestHotkeySpec(unittest.TestCase):
     def test_default_hotkey(self):
         self.assertEqual(hotkey_mod.DEFAULT_HOTKEY, "ctrl+alt+b")
         self.assertEqual(hotkey_mod.load(None).spec(), "ctrl+alt+b")
+
+    def test_conflict_warning(self):
+        # 和系统抢的组合要能报出来：Ctrl+Alt+Del 按下去直接锁屏，
+        # 用户以为设成功了，实际每次用都在锁屏。
+        for spec in ("ctrl+alt+delete", "win+l", "alt+tab", "alt+f4",
+                     "ctrl+shift+esc"):
+            self.assertTrue(
+                hotkey_mod.conflict_warning(hotkey_mod.load(spec)), spec)
+
+    def test_conflict_warning_clean(self):
+        # 常用的自定义组合不该被误报，否则警告等于噪音
+        for spec in ("ctrl+alt+b", "ctrl+shift+k", "ctrl+space"):
+            self.assertEqual(
+                hotkey_mod.conflict_warning(hotkey_mod.load(spec)), "", spec)
+
+    def test_conflict_warning_none(self):
+        self.assertEqual(hotkey_mod.conflict_warning(None), "")
         # 配置被手改坏时不能抛异常，静默退回默认值
         self.assertEqual(hotkey_mod.load("garbage").spec(), "ctrl+alt+b")
 
@@ -443,7 +783,14 @@ class TestStaticChecks(unittest.TestCase):
         self.assertNotIn("tap(VK_HOME, (VK_SHIFT,))", body)
         # 复制完要按换行切出逻辑行，再把选区收到行首
         self.assertIn('got.rfind("\\n")', body)
-        self.assertIn("tap_many(VK_RIGHT, (VK_SHIFT,), cut)", body)
+        # 收回的步数要按「光标步数」算，不能按字符数：CRLF 一个换行是 2 个字符
+        # 但光标跨过去只算 1 步。按字符数会多走几步，把行首后面的字符也选进去。
+        self.assertIn('got[:cut].count("\\r\\n")', body)
+        self.assertIn("tap_many(VK_RIGHT, (VK_SHIFT,), moves)", body)
+        # 光标在文档开头时复制不到东西是正常结果，不能重试时先按右方向键
+        # （那会把光标推后一格，第二次就抓到第一个字符，把文档搞乱）
+        self.assertNotIn("tap(VK_RIGHT)\n", body.split("for attempt")[1]
+                         if "for attempt" in body else "")
 
     def test_grab_line_retries_on_empty_copy(self):
         # 选区要靠目标程序自己处理，程序正忙时 Ctrl+C 可能早于选区建立，
@@ -602,6 +949,48 @@ class TestStaticChecks(unittest.TestCase):
         self.assertGreater(idx, 0)
         body = self.gui[idx:self.gui.find("\n    def ", idx + 10)]
         self.assertIn("self._refresh_tray_tooltip()", body)
+
+    def test_tooltip_goes_through_set_tooltip(self):
+        # 只改 self._tray.tooltip 属性没用：NIM_ADD 时系统已经拿走一份副本，
+        # 后面改属性不会同步过去，用户悬停看到的永远是启动时那句话。
+        # 必须调 set_tooltip，让它发一次 NIM_MODIFY。
+        idx = self.gui.find("def _refresh_tray_tooltip")
+        self.assertGreater(idx, 0)
+        body = self.gui[idx:self.gui.find("\n    def ", idx + 10)]
+        self.assertIn("self._tray.set_tooltip(", body)
+        self.assertNotIn("self._tray.tooltip =", body)
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        t = open(os.path.join(root, "tray.py"), encoding="utf-8").read()
+        self.assertIn("def set_tooltip(", t)
+        self.assertIn("NIM_MODIFY", t)
+        self.assertIn("WM_TRAY_TIP", t)
+        # NIM_MODIFY 那一份必须只带 NIF_TIP，别把气泡通知的字段也塞进去
+        idx = t.find("def _update_tip")
+        self.assertGreater(idx, 0)
+        body = t[idx:t.find("\n    def ", idx + 10)]
+        self.assertIn("nid.uFlags = NIF_TIP", body)
+
+    def test_single_instance_uses_wakeup_event(self):
+        # 收进托盘走的是 withdraw()，那种窗口 ShowWindow(SW_RESTORE) 叫不回来，
+        # 而且主进程内部的 _in_tray 不会跟着改。改用命名事件通知主实例自己恢复。
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        m = open(os.path.join(root, "main.py"), encoding="utf-8").read()
+        self.assertIn("wakeup.request_show()", m)
+        self.assertNotIn("ShowWindow(hwnd, 9)", m)
+
+        w = open(os.path.join(root, "wakeup.py"), encoding="utf-8").read()
+        self.assertIn("CreateEventW", w)
+        self.assertIn("OpenEventW", w)
+        self.assertIn("SetEvent", w)
+        self.assertIn("ResetEvent", w)
+        self.assertIn("WaitForSingleObject", w)
+
+        g = open(os.path.join(root, "gui.py"), encoding="utf-8").read()
+        self.assertIn("wakeup.Waker()", g)
+        self.assertIn("self._waker.poll()", g)
+        self.assertIn("self._stop_waker()", g)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

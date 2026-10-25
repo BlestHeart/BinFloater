@@ -94,6 +94,33 @@ DEFAULT_HOTKEY = "ctrl+alt+b"
 # 用户以后就没法正常打这个字了。允许但必须提醒。
 WARN_NO_MODIFIER = "没有修饰键的快捷键会吞掉这个键的所有按下，建议至少加 Ctrl 或 Alt"
 
+# Windows 自己或常见软件占掉的组合。被占掉的组合里我们能收到按键、也能触发，
+# 但目标程序同样会收到，两边一起动作（比如 Ctrl+Alt+Del 直接锁屏、Win+L 锁屏）。
+# 这些不是「不能用」，是「用了会打架」，所以只警告不拦。
+SYSTEM_HOTKEYS = {
+    "ctrl+alt+delete": "系统保留，按下去直接锁屏",
+    "alt+tab": "切换窗口",
+    "alt+f4": "关闭当前窗口",
+    "ctrl+shift+esc": "打开任务管理器",
+    "ctrl+esc": "打开开始菜单",
+    "win+l": "锁定屏幕",
+    "win+d": "显示桌面",
+    "win+e": "打开资源管理器",
+    "win+r": "打开运行",
+    "win+s": "打开搜索",
+    "win+tab": "任务视图",
+    "ctrl+shift+n": "新建文件夹（资源管理器）",
+    "alt+space": "窗口系统菜单",
+    "ctrl+alt+esc": "任务管理器（旧版快捷方式）",
+}
+
+
+def conflict_warning(hotkey):
+    """返回该快捷键和系统/常用软件冲突的说明，不冲突返回空串。"""
+    if hotkey is None:
+        return ""
+    return SYSTEM_HOTKEYS.get(hotkey.spec(), "")
+
 
 class Hotkey(object):
     """一个解析好的快捷键。"""
