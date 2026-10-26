@@ -2,7 +2,8 @@
 """BinFloater 入口：单实例 + 悬浮窗启动。
 
 命令行：
-  python main.py           正常启动
+  python main.py                       正常启动
+  python main.py --version             打印版本号
   python main.py --decode "01001000"   直接解码打印到控制台（不进界面）
   python main.py --encode "Hi"         直接编码打印到控制台
 """
@@ -10,6 +11,7 @@ import sys
 
 import clipwin
 import core
+import version
 
 _MUTEX_HANDLE = None  # 持有互斥体句柄，进程存活期间有效
 
@@ -32,6 +34,10 @@ def _setup_stdout() -> None:
 def _cli(argv) -> bool:
     """处理命令行直转模式，返回 True 表示已处理完、不进 GUI。"""
     for i, arg in enumerate(argv):
+        # 只要版号就完事，不用为了它去 import gui（那会拉起整套 tkinter）
+        if arg in ("--version", "-v"):
+            print("BinFloater %s" % version.VERSION)
+            return True
         if arg in ("--decode", "-d") and i + 1 < len(argv):
             text = argv[i + 1]
             result, msg = core.binary_to_text(text)

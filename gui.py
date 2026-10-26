@@ -8,6 +8,7 @@
 import json
 import os
 import queue
+import shutil
 import sys
 import time
 import tkinter as tk
@@ -78,11 +79,88 @@ WARN = "#fbbf24"
 ERR = "#f87171"
 
 
-def config_path() -> str:
-    base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    folder = os.path.join(base, APP_NAME)
+# 配置目录算一次就够。save_config 每次落盘都要问一次路径，而下面判断可写是
+# 真去写个探针文件的，每次都做太浪费。
+_CONFIG_DIR = None
+
+
+def _exe_dir() -> str:
+    """程序所在目录。打包成 exe 时是 exe 旁边，从源码跑时是项目目录。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _dir_writable(folder: str) -> bool:
+    """真写一个文件试试。别用 os.access，它在 Windows 上只看只读属性，
+    装在 Program Files 这种要提权的目录时照样返回 True。"""
+    try:
+        os.makedirs(folder, exist_ok=True)
+        probe = os.path.join(folder, ".write-probe")
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+def config_dir() -> str:
+    """配置放哪个目录。
+
+    优先级：
+      1. 环境变量 BINF_CONFIG_DIR —— 显式指定，最高优先（测试也用它隔离）；
+      2. 打包成 exe 时，放在 exe 旁边，也就是安装目录。装到 D 盘配置就留在 D 盘，
+         不往 C 盘的 %APPDATA% 里丢东西；
+      3. 从源码跑、或者程序目录不可写（比如装到了要管理员权限的地方），
+         退回 %APPDATA%\\BinFloater。这是兜底，不是首选。
+    """
+    global _CONFIG_DIR
+    if _CONFIG_DIR:
+        return _CONFIG_DIR
+
+    override = os.environ.get("BINF_CONFIG_DIR")
+    if override:
+        folder = override
+    elif getattr(sys, "frozen", False) and _dir_writable(_exe_dir()):
+        folder = _exe_dir()
+    else:
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        folder = os.path.join(base, APP_NAME)
+
     os.makedirs(folder, exist_ok=True)
-    return os.path.join(folder, "config.json")
+    _CONFIG_DIR = folder
+    return folder
+
+
+def config_path() -> str:
+    return os.path.join(config_dir(), "config.json")
+
+
+def _legacy_config_path() -> str:
+    """老版本放配置的地方（%APPDATA%\\BinFloater\\config.json）。
+
+    1.4 起配置改成跟着安装目录走。老用户升级上来配置还在 C 盘，得搬一次，
+    否则看到的就是「设置全没了」。
+    """
+    base = os.environ.get("APPDATA")
+    if not base:
+        return ""
+    return os.path.join(base, APP_NAME, "config.json")
+
+
+def _migrate_legacy_config() -> None:
+    """把老位置的配置搬到新位置。只在「新位置没有、老位置有」时搬一次，
+    老文件留着不动（万一用户想退回去用旧版本）。"""
+    new = config_path()
+    old = _legacy_config_path()
+    if not old or old == new or os.path.exists(new) or not os.path.isfile(old):
+        return
+    try:
+        shutil.copyfile(old, new)
+        _log("已把老配置从 %s 搬到 %s" % (old, new))
+    except Exception as exc:
+        _log("搬老配置失败: %r" % (exc,))
 
 
 def _log(msg: str) -> None:
@@ -96,6 +174,7 @@ def _log(msg: str) -> None:
 
 
 def load_config() -> dict:
+    _migrate_legacy_config()
     try:
         with open(config_path(), "r", encoding="utf-8") as fh:
             raw = fh.read()
@@ -1066,6 +1145,36 @@ class BinFloater:
                                   bg=CARD, fg=TEAL, font=self.font_meta,
                                   width=6, anchor="e")
         self.width_lbl.pack(side="right")
+
+        # 配置文件放哪儿：装到 D 盘时它就在 D 盘，不会跑到 C 盘的 %APPDATA%。
+        # 一行小字让用户能自己确认，不然「设置存哪了」永远是个谜。
+        frow = tk.Frame(card, bg=CARD)
+        frow.pack(fill="x", padx=12, pady=(0, 10))
+        tk.Label(frow, text="配置", bg=CARD, fg=MUTED,
+                 font=self.font_meta, width=6, anchor="w").pack(side="left")
+        self.cfg_path_lbl = tk.Label(
+            frow, text=config_dir(), bg=CARD, fg=MUTED,
+            font=self.font_meta, anchor="w", justify="left",
+            cursor="hand2",
+        )
+        self.cfg_path_lbl.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        # 点一下直接在资源管理器里打开，省得用户自己对着路径一级级找
+        self.cfg_path_lbl.bind("<Button-1>", lambda e: self._open_config_dir())
+        self.cfg_path_lbl.bind("<Enter>",
+                               lambda e: self.cfg_path_lbl.configure(fg=ACCENT))
+        self.cfg_path_lbl.bind("<Leave>",
+                               lambda e: self.cfg_path_lbl.configure(fg=MUTED))
+
+    def _open_config_dir(self):
+        """在资源管理器里打开配置所在目录。"""
+        folder = config_dir()
+        try:
+            if os.path.isdir(folder):
+                os.startfile(folder)
+            else:
+                self._set_status("配置目录不见了：%s" % folder, WARN, 6000)
+        except Exception as exc:
+            self._set_status("打不开目录：%r" % (exc,), WARN, 6000)
 
     def _on_alpha_slide(self, _value):
         """滑块拖动时实时改窗口透明度。

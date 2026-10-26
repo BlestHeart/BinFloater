@@ -24,11 +24,42 @@ python -m PyInstaller build_onedir.spec --noconfirm --clean
 > 360安全卫士 / 火绒的文件实时防护拦截，弹出 `Could not create temporary directory!`。
 > onedir 启动时完全不解包，实测启动耗时从 2.5 秒降到 0.5 秒。
 
+### 出安装包
+
+```bash
+bash build_installer.sh              # 打包 + 生成安装包
+bash build_installer.sh --no-build   # 只重新生成安装包，用现有 dist/BinFloater
+```
+
+需要 [Inno Setup 6](https://jrsoftware.org/isinfo.php)（`winget install JRSoftware.InnoSetup`）。
+脚本从 `version.py` 读版本号，通过 `BINF_VERSION` 环境变量传给 `installer/BinFloater.iss`，
+产物是 `dist/BinFloater-Setup-<版本>.exe`，约 9 MB（lzma2/max 压缩）。
+
+版本号的唯一来源是 `version.py`，安装包里的 `AppVersion`、`--version` 输出、以后的
+检查更新都读它，别在别处再写一份。
+
+`installer/BinFloater.iss` 里几个不能动的点：
+
+- `AppId` 是固定 GUID，Inno Setup 靠它认「同一个软件」，升级时才能直接覆盖而不
+  变成装了两份。**永远不要改**。
+- `DefaultDirName={code:GetDefaultDir}`：装的时候现算默认目录，挑第一个「是本机固定
+  硬盘、且真的能写文件」的非 C 盘；一块都没有才退回 `{localappdata}`。
+  只看盘符存在不够——有些数据盘根目录只给管理员写权限，所以 `CanWriteUnder` 是
+  真建目录、真写一个探针文件再删掉。
+- `DisableDirPage=no`：目录页永远显示。Inno 默认是 `auto`，在「已经是升级」的场景
+  会把它藏起来，但恰恰是升级时用户最可能想把安装位置改掉。
+- `[InstallDelete]` 先清 `_internal`：onedir 升级时旧版本会留下已经不存在的模块
+  文件，不清的话可能导入到旧的 `.pyd/.pyc`。
+
+`tests/install_check.py` 会真装一遍（静默）、启动、发 WM_CLOSE 优雅退出、再静默卸载，
+核对默认位置确实不在 C 盘、配置确实写到了安装目录而不是 `%APPDATA%`。
+它需要先 `bash build_installer.sh` 出安装包。
+
 ## 源码分块
 
 | 文件 | 职责 |
 | --- | --- |
-| `main.py` | 入口：单实例互斥体、命令行直转 |
+| `main.py` | 入口：单实例互斥体、命令行直转、`--version` |
 | `gui.py` | 悬浮窗界面（tkinter）、配置读写 |
 | `core.py` | 编解码逻辑，纯函数、无副作用 |
 | `clipwin.py` | Win32 剪切板读写与变化监听（ctypes） |
@@ -36,25 +67,29 @@ python -m PyInstaller build_onedir.spec --noconfirm --clean
 | `trigger.py` | 全局键盘钩子（WH_KEYBOARD_LL） |
 | `hotkey.py` | 快捷键的解析 / 存储 / 显示 |
 | `tray.py` | 系统托盘 + 气泡通知（ctypes 自绘） |
+| `wakeup.py` | 命名事件，第二个实例把已有窗口叫回来 |
+| `version.py` | 版本号唯一来源，安装器和 `--version` 都读它 |
 
 只有 `gui.py` 碰 tkinter，其余模块都能在纯命令行下单独跑。
 
 ## 测试
 
 ```bash
-python tests/test_all.py       # 120 项：编解码四种格式 + 格式识别 + 触发逻辑 + 快捷键解析 + 源码约定
-python tests/test_config.py    # 44 项：配置原子写盘、坏文件备份、类型校验、错误日志
+python tests/test_all.py       # 126 项：编解码四种格式 + 格式识别 + 触发逻辑 + 快捷键解析 + 版本号 + 源码约定
+python tests/test_config.py    #  64 项：配置原子写盘、坏文件备份、类型校验、错误日志、配置目录选择、安装脚本
 python tests/smoke_gui.py      # 142 项：真建窗口，控件、钩子、托盘、历史、滑块、录制回显、长文本保护
-python tests/e2e_convert.py    # 23 项：真 Win32 窗口，真按键、真粘贴、选区边界
-python tests/e2e_notepad.py    #  9 项：开真记事本，验证剪切板还原
-python tests/e2e_roundtrip.py  # 18 项：文字 → 二进制 → 文字 往返（含超长会换行的）
+python tests/e2e_convert.py    #  23 项：真 Win32 窗口，真按键、真粘贴、选区边界
+python tests/e2e_notepad.py    #   9 项：开真记事本，验证剪切板还原
+python tests/e2e_roundtrip.py  #  18 项：文字 → 二进制 → 文字 往返（含超长会换行的）
+python tests/install_check.py  #  12 项：真装一遍、启动、优雅退出、卸载，核对装到非 C 盘
 ```
 
-合计 356 项。`e2e_*.py` 会真的动键盘和剪切板，跑之前先把正在编辑的东西存一下。
+合计 394 项（含安装实测 12 项）。`e2e_*.py` 会真的动键盘和剪切板，
+`install_check.py` 会真的往你的 D 盘装一份再卸掉，跑之前先把正在编辑的东西存一下。
 
-`smoke_gui.py` 会把 `APPDATA` 指到临时目录再建窗口，否则测试会把
-`tray_hint_shown`、`space_count` 之类的状态写进你真实的 `config.json`，
-导致「第一次收进托盘时弹提示」这种一次性的行为永远看不到。
+`smoke_gui.py` 和 `test_config.py` 都会把 `BINF_CONFIG_DIR` / `APPDATA` 指到临时目录
+再建窗口，否则测试会把 `tray_hint_shown`、`space_count` 之类的状态写进你真实的
+`config.json`，导致「第一次收进托盘时弹提示」这种一次性的行为永远看不到。
 
 `e2e_*` 里的 `convert_pumped` 有三处防抖，都是踩出来的，别随手删：
 
@@ -68,12 +103,29 @@ python tests/e2e_roundtrip.py  # 18 项：文字 → 二进制 → 文字 往返
 
 ## 配置怎么存的
 
-`%APPDATA%\BinFloater\config.json`，纯 JSON，键很少（`trigger_mode`、
-`space_count`、`hotkey`、`dir_mode`、`format`、`separator`、`x`、`y`、
-`alpha`、`topmost`、`auto_copy`、`clip_paused`、`collapsed`、`width`、
-`first_run_done`、`tray_hint_shown`）。改动即时落盘，不等退出。
+纯 JSON，键很少（`trigger_mode`、`space_count`、`hotkey`、`dir_mode`、`format`、
+`separator`、`x`、`y`、`alpha`、`topmost`、`auto_copy`、`clip_paused`、
+`collapsed`、`width`、`first_run_done`、`tray_hint_shown`）。改动即时落盘，不等退出。
 
-三个地方是特意这么写的：
+**放哪儿按这个顺序挑**（`gui.config_dir()`）：
+
+1. 环境变量 `BINF_CONFIG_DIR` —— 显式指定，最高优先。测试靠它隔离。
+2. 打包成 exe 且程序目录可写 → 放 exe 旁边，也就是安装目录。
+   装到 D 盘，`config.json` 就在 `D:\Programs\BinFloater\`，不往 C 盘的
+   `%APPDATA%` 里丢东西。
+3. 从源码跑、或程序目录不可写（装在 Program Files 这种要提权的目录）→
+   退回 `%APPDATA%\BinFloater`。**这是兜底，不是首选。**
+
+判断「可写」不能用 `os.access`——它在 Windows 上只看只读属性，装在 Program Files
+时照样返回 True。`_dir_writable` 是真去建目录、写一个 `.write-probe`、再删掉。
+
+从 1.3 及更早版本升级上来时，`_migrate_legacy_config()` 会在「新位置没有配置、
+老位置 `%APPDATA%\BinFloater\config.json` 有」时复制一份过来，老文件保留不动。
+
+设置卡片底部有一行小字显示实际目录，点一下用 `os.startfile` 打开。
+用户不需要知道 `%APPDATA%` 是什么，但想知道「设置存哪了」时必须能查到。
+
+四个地方是特意这么写的：
 
 1. **原子写**：先写 `config.json.tmp`，`flush` + `fsync`，再 `os.replace`
    覆盖。直接以 `"w"` 打开原文件会先把它截断，万一进程在写入中途被结束
@@ -81,8 +133,10 @@ python tests/e2e_roundtrip.py  # 18 项：文字 → 二进制 → 文字 往返
    设置回到默认值——用户看到的现象就是「怎么没记住」。
 2. **坏文件先备份**：解析失败时把原文件改名成 `config.json.bad` 再退回默认值，
    不直接覆盖掉，否则用户的改动和问题现场一起没了。
-3. **出错写日志**：`%APPDATA%\BinFloater\error.log`。以前 `except: pass`
+3. **出错写日志**：同目录的 `error.log`。以前 `except: pass`
    把所有异常吞掉，线上出问题只能靠猜。
+4. **写失败要说出来**：`_save()` 里发现落盘失败会直接打到状态栏，
+   不能只在日志里记一笔——用户以为设置存上了，下次打开又是旧值。
 
 启动时状态栏会主动念一遍恢复出来的设置（`已恢复：空格连按 ×4`），
 这样「到底记没记住」一眼就能看到，不用去翻配置文件。
@@ -140,3 +194,13 @@ pystray 不支持气泡通知（`NIF_INFO`），而「收进托盘时告诉用�
   产品本身不受影响——`convert_line` 只用导航键和 `Ctrl+C/V`，不经过输入法。
 - **窗口过程必须是类属性**：`wc.lpfnWndProc = WNDPROC(lambda ...)` 用临时对象时，
   对象被 GC 回收后窗口过程指针悬空，窗口一收消息就 access violation。
+- **Inno Setup 的 Pascal Script 没有字符 for 循环**：`for drive := 'D' to 'Z'`
+  报 `Type mismatch`，只能用整型循环 `for code := 68 to 90` + `Chr(code)`。
+- **Inno 的 `continue` 也不稳**：早期写法用了 `if ... then continue;`，编译能过但
+  在 `GetDefaultDir` 里行为不对，改成嵌套 `if` 更保险。
+- **静默安装测试不能让程序被 `taskkill /F`**：程序只在正常退出时才写 `config.json`，
+  强杀掉就没写出来，测试会误判成「配置没写到安装目录」。要 `PostMessage WM_CLOSE`。
+- **Inno 的 `[Languages]` 引官方中文包**：`ChineseSimplified.isl` 在 issrc 仓库的
+  `Files/Languages/`（不是 `Unofficial/`），本地要和 `.iss` 放同一目录，或者写全路径。
+- **emoji 在 Tk + 微软雅黑下渲染成方块**：`⌖`、`⌄`、`🔒`、`⏸` 都踩过。
+  换成 ASCII 或 BMP 区符号（`◉`、`▼`、`‖`）。

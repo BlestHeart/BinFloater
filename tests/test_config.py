@@ -12,9 +12,11 @@ import shutil
 import sys
 import tempfile
 
-# 必须在 import gui 之前把 APPDATA 指到临时目录，否则会写用户的真实配置
+# 必须在 import gui 之前把配置目录指到临时目录，否则会写用户的真实配置。
+# BINF_CONFIG_DIR 是 1.4 起的显式覆盖；APPDATA 留着是因为还要测老位置迁移。
 _TMP_APPDATA = tempfile.mkdtemp(prefix="binfloater_cfg_")
 os.environ["APPDATA"] = _TMP_APPDATA
+os.environ["BINF_CONFIG_DIR"] = _TMP_APPDATA
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -169,6 +171,115 @@ check("_as_int 坏值走默认", gui._as_int("左边", 7) == 7)
 check("_as_int 收 None", gui._as_int(None, 7) == 7)
 check("_as_int 收列表", gui._as_int([1], 7) == 7)
 check("_as_int 夹上界", gui._as_int(99999999, 0, 0, 100) == 100)
+
+# 13. 配置放哪儿：用户的硬要求是「不准在 C 盘拉屎」。
+#     1.4 起配置跟着安装目录走——装到 D 盘，config.json 就在 D 盘，
+#     不再往 %APPDATA%（C 盘）里丢。这里把三种分支都钉住。
+check("有 config_dir", "def config_dir(" in src)
+check("有 _exe_dir", "def _exe_dir(" in src)
+check("有 _dir_writable", "def _dir_writable(" in src)
+
+
+def _with_env(**kw):
+    """临时改环境变量 + 清掉目录缓存，用完还原。"""
+    saved = {k: os.environ.get(k) for k in kw}
+    saved_dir = gui._CONFIG_DIR
+    for k, v in kw.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+    gui._CONFIG_DIR = None
+    return saved, saved_dir
+
+
+def _restore(saved, saved_dir):
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+    gui._CONFIG_DIR = saved_dir
+
+
+# 分支一：BINF_CONFIG_DIR 显式指定，优先于一切
+_want = tempfile.mkdtemp(prefix="binfloater_where_")
+_saved, _sdir = _with_env(BINF_CONFIG_DIR=_want)
+check("BINF_CONFIG_DIR 生效", gui.config_dir() == _want, gui.config_dir())
+check("config.json 在那个目录下",
+      gui.config_path() == os.path.join(_want, "config.json"))
+_restore(_saved, _sdir)
+
+# 分支二：打包成 exe 且程序目录可写 → 配置放 exe 旁边（安装目录）
+#         用假的 sys.frozen + sys.executable 模拟，不用真打包。
+_fake_dir = tempfile.mkdtemp(prefix="binfloater_exe_")
+_saved, _sdir = _with_env(BINF_CONFIG_DIR=None)
+_saved_exe = sys.executable
+_old_frozen = getattr(sys, "frozen", None)
+sys.frozen = True
+sys.executable = os.path.join(_fake_dir, "BinFloater.exe")
+gui._CONFIG_DIR = None
+check("打包后配置放 exe 旁边（安装目录）", gui.config_dir() == _fake_dir, gui.config_dir())
+check("打包后不再写 %APPDATA%",
+      not gui.config_path().lower().startswith(os.environ.get("APPDATA", "\0").lower() + os.sep
+                                               + "binfloater"),
+      gui.config_path())
+_restore(_saved, _sdir)
+sys.executable = _saved_exe
+if _old_frozen is None:
+    try:
+        del sys.frozen
+    except AttributeError:
+        pass
+else:
+    sys.frozen = _old_frozen
+gui._CONFIG_DIR = None
+
+# 分支三：_dir_writable 真的会去写，写不了就返回 False
+check("_dir_writable 可写目录返回 True", gui._dir_writable(_fake_dir) is True)
+check("_dir_writable 非法路径返回 False",
+      gui._dir_writable(os.path.join(_fake_dir, "a\0b")) is False)
+# 探针文件用完必须删掉，不能留在目录里
+check("探针文件没残留", not os.path.exists(os.path.join(_fake_dir, ".write-probe")))
+
+# 分支四：老位置的配置要能自动搬过来，否则老用户升级后「设置全没了」
+_legacy_root = tempfile.mkdtemp(prefix="binfloater_legacy_")
+_new_root = tempfile.mkdtemp(prefix="binfloater_new_")
+os.makedirs(os.path.join(_legacy_root, "BinFloater"), exist_ok=True)
+_legacy_cfg = os.path.join(_legacy_root, "BinFloater", "config.json")
+with open(_legacy_cfg, "w", encoding="utf-8") as _fh:
+    _fh.write('{"space_count": 5}')
+_saved, _sdir = _with_env(APPDATA=_legacy_root, BINF_CONFIG_DIR=_new_root)
+gui._migrate_legacy_config()
+_migrated = os.path.join(_new_root, "config.json")
+check("老配置被搬到新位置", os.path.isfile(_migrated))
+check("搬过来的内容一致", gui.load_config().get("space_count") == 5,
+      gui.load_config())
+# 新位置已有配置时不覆盖
+with open(_migrated, "w", encoding="utf-8") as _fh:
+    _fh.write('{"space_count": 9}')
+gui._migrate_legacy_config()
+check("新位置有配置就不覆盖", gui.load_config().get("space_count") == 9)
+_restore(_saved, _sdir)
+for _d in (_legacy_root, _new_root, _fake_dir):
+    shutil.rmtree(_d, ignore_errors=True)
+
+# 14. 安装脚本：目录页必须出现，默认值不能是写死的 C 盘路径
+_iss_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "installer", "BinFloater.iss")
+if os.path.isfile(_iss_path):
+    with open(_iss_path, "r", encoding="utf-8-sig") as _fh:
+        _iss = _fh.read()
+    check("安装包有目录页", "DisableDirPage=no" in _iss)
+    check("默认目录由代码算", "DefaultDirName={code:GetDefaultDir}" in _iss)
+    check("有 GetDefaultDir", "function GetDefaultDir(" in _iss)
+    check("挑盘时看 DriveType", "GetDriveTypeA(" in _iss)
+    check("真的试写一个文件", "SaveStringToFile(" in _iss)
+    check("固定 AppId 不能改", "{6E078910-A416-4F0B-91CE-0B0130B04265" in _iss)
+    check("iss 里没有写死本机路径",
+          "G:\\" not in _iss and "C:\\Users" not in _iss and "Administrator" not in _iss)
+else:
+    check("找得到安装脚本", False, _iss_path)
 
 shutil.rmtree(_TMP_APPDATA, ignore_errors=True)
 

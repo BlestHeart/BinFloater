@@ -6,11 +6,12 @@ import tempfile
 import time
 import tkinter as tk
 
-# 必须在 import gui 之前把 APPDATA 指到临时目录：gui.config_path() 读的就是它。
+# 必须在 import gui 之前把配置目录指到临时目录：gui.config_path() 会读它。
 # 否则这个测试会写真实配置——曾经把 tray_hint_shown 置成 true，
 # 结果用户永远看不到「已收进托盘」那条气泡通知。
 _TMP_APPDATA = tempfile.mkdtemp(prefix="binfloater_smoke_")
 os.environ["APPDATA"] = _TMP_APPDATA
+os.environ["BINF_CONFIG_DIR"] = _TMP_APPDATA
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

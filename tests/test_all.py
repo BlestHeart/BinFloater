@@ -698,6 +698,62 @@ def root_dir():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+class TestVersion(unittest.TestCase):
+
+    """版本号只能有一个来源。
+
+    以前版本号散落在几处（spec 里、README 里、Release tag 里），改一处忘一处
+    就会出现「装的 1.4.0、--version 说 1.3.0」这种事。现在 version.py 说了算。
+    """
+
+    def test_version_shape(self):
+        import version
+        parts = version.VERSION.split(".")
+        self.assertEqual(len(parts), 3, "版本号要写成 主.次.修订：%r" % (version.VERSION,))
+        for p in parts:
+            self.assertTrue(p.isdigit(), "版本号每段都要是数字：%r" % (version.VERSION,))
+
+    def test_version_tuple(self):
+        import version
+        # 末尾的 0 会被砍掉，这样 1.4 和 1.4.0 比较起来是同一个版本
+        self.assertEqual(version.version_tuple("1.4.0"), (1, 4))
+        self.assertEqual(version.version_tuple("v1.4.0"), (1, 4))
+        self.assertEqual(version.version_tuple("1.4.5"), (1, 4, 5))
+        self.assertEqual(version.version_tuple("1.10.0"), (1, 10))
+        self.assertEqual(version.version_tuple("1.4.0-beta1"), (1, 4))
+        self.assertEqual(version.version_tuple("v2.0.0-beta1"), (2,))
+        self.assertEqual(version.version_tuple(""), ())
+        self.assertEqual(version.version_tuple("abc"), ())
+
+    def test_is_newer(self):
+        import version
+        self.assertTrue(version.is_newer("1.5.0", "1.4.0"))
+        self.assertTrue(version.is_newer("1.10.0", "1.9.0"))
+        self.assertFalse(version.is_newer("1.4.0", "1.4.0"))
+        self.assertFalse(version.is_newer("1.3.0", "1.4.0"))
+
+    def test_main_reads_version_module(self):
+        # --version 不能为此 import gui（会拉起整套 tkinter）
+        src = open(os.path.join(root_dir(), "main.py"), encoding="utf-8").read()
+        self.assertIn("import version", src)
+        self.assertIn("version.VERSION", src)
+        # 只检查真正的 import 语句：注释里出现「不用为了它去 import gui」是正常的
+        head = src.split("def main")[0]
+        imports = [ln.strip() for ln in head.splitlines() if ln.strip().startswith(("import ", "from "))]
+        self.assertNotIn("import gui", imports)
+        self.assertFalse([ln for ln in imports if ln.startswith("from gui")])
+
+    def test_spec_bundles_version(self):
+        # hiddenimports 里必须有 version，否则打包后 --version 会 ImportError
+        spec = open(os.path.join(root_dir(), "build_onedir.spec"), encoding="utf-8").read()
+        self.assertIn('"version"', spec)
+
+    def test_iss_takes_version_from_env(self):
+        iss = open(os.path.join(root_dir(), "installer", "BinFloater.iss"),
+                   encoding="utf-8-sig").read()
+        self.assertIn("GetEnv(\"BINF_VERSION\")", iss)
+
+
 class TestStaticChecks(unittest.TestCase):
 
     """源码层面的约定。这些是踩过坑写下的，改动时别悄悄破坏。"""
