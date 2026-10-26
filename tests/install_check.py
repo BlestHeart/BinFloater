@@ -58,8 +58,13 @@ def main():
     print("\n预期安装到：%s" % want)
     check("默认位置不在 C 盘", not want.upper().startswith("C:"), want)
 
-    setup = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "dist", "BinFloater-Setup-1.4.0.exe")
+    # 安装包名带版本号，不能写死：每次改 version.py 就得回来改这里，
+    # 忘了就是「安装包不存在」——而包其实好端端在 dist 里。
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import version
+    setup = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "dist", "BinFloater-Setup-%s.exe" % version.VERSION)
     check("安装包存在", os.path.isfile(setup), setup)
     if not os.path.isfile(setup):
         return finish(ok, bad)

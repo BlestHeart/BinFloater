@@ -17,6 +17,8 @@ import core
 import hotkey as hotkey_mod
 import keys as keys_mod
 import trigger
+import update as update_mod
+import version as version_mod
 
 
 class TestCore(unittest.TestCase):
@@ -1046,6 +1048,180 @@ class TestStaticChecks(unittest.TestCase):
         self.assertIn("wakeup.Waker()", g)
         self.assertIn("self._waker.poll()", g)
         self.assertIn("self._stop_waker()", g)
+
+
+class TestUpdate(unittest.TestCase):
+
+    """检查更新。
+
+    这里全部离线测：网络调用一律用本地假装接口，不去碰 api.github.com。
+    否则一个限流或网络抖动就能让整个回归变红，而那不是代码的问题。
+    """
+
+    def test_parse_newer(self):
+        r = update_mod.parse_release({
+            "tag_name": "v9.9.9", "name": "测试版",
+            "body": "- 修了 A", "html_url": "https://example.com/dl",
+        })
+        self.assertEqual(r.status, update_mod.OK)
+        self.assertTrue(r.has_update)
+        self.assertEqual(r.latest, "v9.9.9")
+        self.assertEqual(r.html_url, "https://example.com/dl")
+
+    def test_parse_same_version(self):
+        r = update_mod.parse_release({"tag_name": version_mod.VERSION})
+        self.assertEqual(r.status, update_mod.UP_TO_DATE)
+        self.assertFalse(r.has_update)
+
+    def test_parse_older(self):
+        r = update_mod.parse_release({"tag_name": "v0.0.1"})
+        self.assertEqual(r.status, update_mod.UP_TO_DATE)
+        self.assertFalse(r.has_update)
+
+    def test_parse_ignores_draft_and_prerelease(self):
+        # 草稿是还没发的，预发布是给测试的，都不该推给普通用户
+        self.assertEqual(
+            update_mod.parse_release(
+                {"tag_name": "v9.9.9", "draft": True}).status,
+            update_mod.UP_TO_DATE)
+        self.assertEqual(
+            update_mod.parse_release(
+                {"tag_name": "v9.9.9", "prerelease": True}).status,
+            update_mod.UP_TO_DATE)
+
+    def test_parse_bad_payloads(self):
+        for payload in ([], "x", 5, {}, {"tag_name": ""}):
+            r = update_mod.parse_release(payload)
+            self.assertEqual(r.status, update_mod.BAD_JSON, repr(payload))
+
+    def test_summary_line(self):
+        info = update_mod.UpdateInfo(
+            update_mod.OK, body="# 标题\n\n- 甲\n- 乙\n\n正文")
+        self.assertEqual(update_mod.summary_line(info), "标题 / 甲 / 乙 / 正文")
+        self.assertEqual(update_mod.summary_line(None), "")
+        self.assertEqual(
+            update_mod.summary_line(update_mod.UpdateInfo(update_mod.OK)), "")
+        long = update_mod.UpdateInfo(update_mod.OK, body="x" * 900)
+        self.assertEqual(len(update_mod.summary_line(long, 100)), 101)
+
+    def test_api_urls(self):
+        self.assertEqual(update_mod.API_LATEST,
+                         "https://api.github.com/repos/BlestHeart/BinFloater"
+                         "/releases/latest")
+        self.assertIn("github.com", update_mod.RELEASES_PAGE)
+        # GitHub 不带 UA 直接 403，这是硬要求
+        self.assertIn("BinFloater/", update_mod.USER_AGENT)
+        self.assertIn(version_mod.VERSION, update_mod.USER_AGENT)
+
+    def test_fetch_against_local_server(self):
+        """本地假接口跑一遍，覆盖 200 / 404 / 403 / 500 / 非 JSON / 连不上。"""
+        import http.server
+        import threading
+        import urllib.request as urlreq
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            mode = "200"
+
+            def do_GET(self):
+                if Handler.mode == "200":
+                    body = json.dumps({
+                        "tag_name": "v9.9.9",
+                        "body": "- 新功能",
+                        "html_url": "https://example.com/dl",
+                    }).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif Handler.mode == "bad":
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"<html>login</html>")
+                else:
+                    self.send_response(int(Handler.mode))
+                    self.end_headers()
+                    self.wfile.write(b'{"message":"x"}')
+
+            def log_message(self, *args):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever)
+        t.daemon = True
+        t.start()
+        url = "http://127.0.0.1:%d/releases/latest" % port
+        # 本地回环不能走代理（系统里可能配着代理），换成空 ProxyHandler
+        saved = {}
+        for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+            saved[k] = os.environ.pop(k, None)
+        urlreq.install_opener(urlreq.build_opener(urlreq.ProxyHandler({})))
+        try:
+            Handler.mode = "200"
+            r = update_mod.fetch(url=url)
+            self.assertEqual(r.status, update_mod.OK)
+            self.assertEqual(r.latest, "v9.9.9")
+
+            Handler.mode = "404"
+            self.assertEqual(update_mod.fetch(url=url).status,
+                             update_mod.NOT_FOUND)
+
+            Handler.mode = "403"
+            self.assertEqual(update_mod.fetch(url=url).status,
+                             update_mod.FORBIDDEN)
+
+            Handler.mode = "500"
+            self.assertEqual(update_mod.fetch(url=url).status,
+                             update_mod.HTTP_ERROR)
+
+            Handler.mode = "bad"
+            self.assertEqual(update_mod.fetch(url=url).status,
+                             update_mod.BAD_JSON)
+
+            # 连不上的端口 -> network
+            dead = update_mod.fetch(url="http://127.0.0.1:1/x", timeout=2)
+            self.assertEqual(dead.status, update_mod.NETWORK)
+            self.assertTrue(dead.message)
+        finally:
+            urlreq.install_opener(None)
+            srv.shutdown()
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_check_async_calls_back(self):
+        import threading
+        got = []
+        done = threading.Event()
+
+        def cb(result):
+            got.append(result)
+            done.set()
+
+        th = update_mod.check_async(cb, url="http://127.0.0.1:1/x")
+        self.assertIsInstance(th, threading.Thread)
+        # 守护线程：关程序时不用等这次网络超时
+        self.assertTrue(th.daemon)
+        self.assertTrue(done.wait(30))
+        self.assertEqual(got[0].status, update_mod.NETWORK)
+
+    def test_gui_wiring(self):
+        """静态检查 gui.py 里该接的线还在。"""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        g = open(os.path.join(root, "gui.py"), encoding="utf-8").read()
+        self.assertIn("import update as update_mod", g)
+        self.assertIn("update_mod.check_async(", g)
+        self.assertIn("def _maybe_auto_check_update", g)
+        self.assertIn("def _drain_updates", g)
+        self.assertIn("def _on_update_result", g)
+        self.assertIn("def _open_release_page", g)
+        self.assertIn("os.startfile(target)", g)
+        self.assertIn("_update_auto", g)
+        self.assertIn("update_last_day", g)
+        # 网络线程不能直接碰 tkinter：结果必须走 queue
+        self.assertIn("self._updates.put_nowait(result)", g)
+        self.assertIn("self.root.after(200, self._drain_updates)", g)
 
 
 if __name__ == "__main__":

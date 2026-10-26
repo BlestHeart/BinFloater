@@ -69,22 +69,23 @@ bash build_installer.sh --no-build   # 只重新生成安装包，用现有 dist
 | `tray.py` | 系统托盘 + 气泡通知（ctypes 自绘） |
 | `wakeup.py` | 命名事件，第二个实例把已有窗口叫回来 |
 | `version.py` | 版本号唯一来源，安装器和 `--version` 都读它 |
+| `update.py` | 检查更新：问 GitHub Releases API，只返回结果不碰界面 |
 
 只有 `gui.py` 碰 tkinter，其余模块都能在纯命令行下单独跑。
 
 ## 测试
 
 ```bash
-python tests/test_all.py       # 126 项：编解码四种格式 + 格式识别 + 触发逻辑 + 快捷键解析 + 版本号 + 源码约定
+python tests/test_all.py       # 136 项：编解码四种格式 + 格式识别 + 触发逻辑 + 快捷键解析 + 版本号 + 检查更新 + 源码约定
 python tests/test_config.py    #  64 项：配置原子写盘、坏文件备份、类型校验、错误日志、配置目录选择、安装脚本
-python tests/smoke_gui.py      # 142 项：真建窗口，控件、钩子、托盘、历史、滑块、录制回显、长文本保护
+python tests/smoke_gui.py      # 168 项：真建窗口，控件、钩子、托盘、历史、滑块、录制回显、长文本保护、检查更新
 python tests/e2e_convert.py    #  23 项：真 Win32 窗口，真按键、真粘贴、选区边界
 python tests/e2e_notepad.py    #   9 项：开真记事本，验证剪切板还原
 python tests/e2e_roundtrip.py  #  18 项：文字 → 二进制 → 文字 往返（含超长会换行的）
 python tests/install_check.py  #  12 项：真装一遍、启动、优雅退出、卸载，核对装到非 C 盘
 ```
 
-合计 394 项（含安装实测 12 项）。`e2e_*.py` 会真的动键盘和剪切板，
+合计 418 项（含安装实测 12 项）。`e2e_*.py` 会真的动键盘和剪切板，
 `install_check.py` 会真的往你的 D 盘装一份再卸掉，跑之前先把正在编辑的东西存一下。
 
 `smoke_gui.py` 和 `test_config.py` 都会把 `BINF_CONFIG_DIR` / `APPDATA` 指到临时目录
@@ -105,7 +106,8 @@ python tests/install_check.py  #  12 项：真装一遍、启动、优雅退出�
 
 纯 JSON，键很少（`trigger_mode`、`space_count`、`hotkey`、`dir_mode`、`format`、
 `separator`、`x`、`y`、`alpha`、`topmost`、`auto_copy`、`clip_paused`、
-`collapsed`、`width`、`first_run_done`、`tray_hint_shown`）。改动即时落盘，不等退出。
+`collapsed`、`width`、`first_run_done`、`tray_hint_shown`、`update_check`、
+`update_last_day`）。改动即时落盘，不等退出。
 
 **放哪儿按这个顺序挑**（`gui.config_dir()`）：
 
@@ -182,6 +184,24 @@ Windows 有 `LowLevelHooksTimeout`（默认 300ms）。回调超时会被系统
 pystray 不支持气泡通知（`NIF_INFO`），而「收进托盘时告诉用户触发还能用」
 正靠它。
 
+### 检查更新只提醒、不自动替换
+
+`update.py` 只负责「问一次 GitHub → 返回一个结果对象」，不碰 tkinter，
+也不下载任何东西。三个约束写成了硬规则：
+
+- **不自己替换 exe。** onedir 分发时 `BinFloater.exe` 和 `_internal` 里的 dll
+  都被当前进程占用，Windows 不允许改写正在运行的映像。先退出再换得靠外部脚本
+  蹲着等进程结束，而这种行为在装了 360 / 火绒的机器上大概率被拦，且拦了用户
+  什么提示都看不到。升级走安装包双击覆盖。
+- **一天只查一次。** 匿名调 `api.github.com` 限 60 次/小时（按 IP）。查过就把
+  日期写进 `update_last_day`，同一天再启动直接跳过。
+- **后台线程只入队，不碰 Tk。** Tk 不是线程安全的。`_check_update` 把回调包成
+  「往 `self._updates` 里 `put_nowait`」，主线程 `_drain_updates` 每 200ms 取。
+
+私有仓库的匿名请求会得到 404（GitHub 不区分「不存在」和「没权限」），所以 404
+单独归成 `NOT_FOUND`，界面上写「仓库还没公开」而不是「网络故障」——后者会让人
+去查防火墙，方向全错。
+
 ## 踩过的坑
 
 - **Windows 控制台是 GBK**：Python 脚本里的中文 `print` 到管道里会乱码，
@@ -204,3 +224,15 @@ pystray 不支持气泡通知（`NIF_INFO`），而「收进托盘时告诉用�
   `Files/Languages/`（不是 `Unofficial/`），本地要和 `.iss` 放同一目录，或者写全路径。
 - **emoji 在 Tk + 微软雅黑下渲染成方块**：`⌖`、`⌄`、`🔒`、`⏸` 都踩过。
   换成 ASCII 或 BMP 区符号（`◉`、`▼`、`‖`）。
+- **`urllib` 会自动读系统代理**，而本地回环测试不能走代理。测本地 HTTP
+  服务时要先 `urlreq.install_opener(build_opener(ProxyHandler({})))` 并临时
+  清掉 `http(s)_proxy` 环境变量，否则请求会被导到代理上去。
+- **`PyInstaller` 静态分析扫不到延迟 import**：`wakeup` 和 `update` 都在函数体里
+  才 import（或只被 `import update as update_mod` 这种别名形式引用），必须写进
+  `build_onedir.spec` 的 `hiddenimports`，否则打包后运行到那一步才 ImportError。
+  验证方法：`CArchiveReader` 先 `extract("PYZ.pyz")`，再 `ZlibArchiveReader` 读；
+  直接拿 CArchiveReader 去当 ZlibArchiveReader 用会报
+  `ArchiveReadError: PYZ magic pattern mismatch!`。
+- **查 PYZ 里有没有某函数，`repr(module_object)` 是不行的**：要递归走
+  `co_consts` 和 `co_names` 收集字符串。直接对模块对象做 `repr` 再看关键字
+  全是 False，容易误判成「没打包进去」。

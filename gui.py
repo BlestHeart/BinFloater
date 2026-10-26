@@ -21,6 +21,8 @@ import hotkey as hotkey_mod
 import keys
 import tray
 import trigger
+import update as update_mod
+import version
 
 APP_NAME = "BinFloater"
 W_WIDTH = 404
@@ -434,6 +436,16 @@ class BinFloater:
         self._triggers = queue.Queue()
         # 拖放进来的文件路径，同样由窗口过程入队、主线程取
         self._drops = queue.Queue()
+        # 检查更新：网络请求在后台线程，结果塞这个队列由主线程取。
+        # 钩子回调不能碰 tkinter 同理，网络线程也不能碰——Tk 不是线程安全的。
+        self._updates = queue.Queue()
+        self._update_checking = False
+        self._update_result = None
+        self._update_btn = None
+        self._update_lbl = None
+        # 上次自动检查的日期（YYYY-MM-DD）。一天只查一次，不然每启动一次
+        # 都往 api.github.com 发请求，匿名限流 60 次/小时很快就用完。
+        self._update_last_day = str(self.cfg.get("update_last_day", ""))
         self._watcher = None
         # 用户最近用的那个窗口。面板按钮触发时要先把焦点还回去。
         self._last_foreign_hwnd = 0
@@ -459,6 +471,7 @@ class BinFloater:
         self.root.after(200, self._poll)
         self.root.after(120, self._drain_triggers)
         self.root.after(120, self._drain_tray_events)
+        self.root.after(200, self._drain_updates)
         # 透明度/宽度滑块只在松手时落盘，拖动中每次回调都写盘没必要
         try:
             self.alpha_scale.bind("<ButtonRelease-1>", self._on_alpha_release)
@@ -477,6 +490,9 @@ class BinFloater:
         self._set_status(self._boot_text(), TEAL, 3200)
         # 第一次用的人不知道那行「已恢复：Ctrl+Alt+B」是干嘛的，得说清楚
         self.root.after(600, self._maybe_first_run)
+        # 自动检查更新放在最后：先把界面和托盘都建好，查到结果才有地方显示。
+        # 延后 3 秒再发网络请求，不要跟启动时的剪切板读取抢时间。
+        self.root.after(3000, self._maybe_auto_check_update)
 
     def _maybe_first_run(self):
         """首次运行提示：只在从没成功显示过时弹一次。
@@ -1165,6 +1181,216 @@ class BinFloater:
         self.cfg_path_lbl.bind("<Leave>",
                                lambda e: self.cfg_path_lbl.configure(fg=MUTED))
 
+        # 版本与更新。用户提的「能不能做自动检查更新」就落在这一行：
+        # 左边显示当前版本 + 检查结果，右边一个按钮手动再查一次。
+        vrow = tk.Frame(card, bg=CARD)
+        vrow.pack(fill="x", padx=12, pady=(0, 10))
+        tk.Label(vrow, text="版本", bg=CARD, fg=MUTED,
+                 font=self.font_meta, width=6, anchor="w").pack(side="left")
+        self._update_btn = tk.Label(
+            vrow, text="检查更新", bg=CARD_HI, fg=MUTED,
+            font=self.font_meta, padx=8, pady=2, cursor="hand2",
+        )
+        self._update_btn.pack(side="right")
+        self._update_btn.bind("<Button-1>", lambda e: self._check_update(manual=True))
+        self._update_btn.bind("<Enter>",
+                              lambda e: self._update_btn.configure(fg=ACCENT))
+        self._update_btn.bind("<Leave>",
+                              lambda e: self._update_btn.configure(fg=self._update_btn_fg()))
+        self._update_lbl = tk.Label(
+            vrow, text=self._version_text(), bg=CARD, fg=MUTED,
+            font=self.font_meta, anchor="w", justify="left",
+        )
+        self._update_lbl.pack(side="left", fill="x", expand=True, padx=(4, 6))
+
+        # 自动检查开关。默认开，但得能关：有人就是不想让程序联网。
+        crow = tk.Frame(card, bg=CARD)
+        crow.pack(fill="x", padx=12, pady=(0, 10))
+        tk.Label(crow, text="更新", bg=CARD, fg=MUTED,
+                 font=self.font_meta, width=6, anchor="w").pack(side="left")
+        self.update_auto_btn = tk.Label(crow, bg=CARD_HI, font=self.font_meta,
+                                        padx=8, pady=2, cursor="hand2")
+        self.update_auto_btn.pack(side="left", padx=(4, 6))
+        self.update_auto_btn.bind("<Button-1>", lambda e: self._toggle_auto_update())
+        tk.Label(crow, text="每天启动查一次", bg=CARD, fg=MUTED,
+                 font=self.font_meta, anchor="w").pack(side="left")
+        self._update_auto = _as_bool(self.cfg.get("update_check", True), True)
+        self._paint_auto_update_btn()
+
+    def _paint_auto_update_btn(self):
+        try:
+            if self._update_auto:
+                self.update_auto_btn.configure(text="自动检查 开", fg=TEAL)
+            else:
+                self.update_auto_btn.configure(text="自动检查 关", fg=MUTED)
+        except tk.TclError:
+            pass
+
+    def _toggle_auto_update(self):
+        self._update_auto = not self._update_auto
+        self.cfg["update_check"] = self._update_auto
+        self._save()
+        self._paint_auto_update_btn()
+        if self._update_auto:
+            self._set_status("已开启自动检查更新（每天启动时查一次）", TEAL, 5000)
+        else:
+            self._set_status("已关闭自动检查更新，需要时点「检查更新」", MUTED, 5000)
+
+    def _update_btn_fg(self):
+        """「检查更新」按钮该用什么颜色：查到新版用亮色提醒。"""
+        res = self._update_result
+        if res is not None and res.has_update:
+            return TEAL
+        return MUTED
+
+    def _version_text(self):
+        """版本那一行显示什么。
+
+        四种情况各说一句：刚启动/检查中、查到新版、已是最新、查失败。
+        失败时把原因写出来——「检查更新失败」这种话等于没说。
+        """
+        cur = "v%s" % version.VERSION
+        if self._update_checking:
+            return "%s · 正在检查…" % cur
+        res = self._update_result
+        if res is None:
+            return cur
+        if res.has_update:
+            return "%s · 有新版本 %s" % (cur, res.latest)
+        if res.status == update_mod.UP_TO_DATE:
+            return "%s · 已是最新" % cur
+        return "%s · %s" % (cur, res.message or "没查到")
+
+    def _paint_update_row(self):
+        """把版本行的文字和按钮状态刷一遍。"""
+        if self._update_lbl is None or self._update_btn is None:
+            return
+        try:
+            self._update_lbl.configure(
+                text=self._version_text(),
+                fg=TEAL if (self._update_result is not None
+                            and self._update_result.has_update) else MUTED,
+            )
+            if self._update_checking:
+                self._update_btn.configure(text="检查中…", fg=MUTED, cursor="arrow")
+            elif self._update_result is not None and self._update_result.has_update:
+                self._update_btn.configure(text="去下载", fg=TEAL, cursor="hand2")
+            else:
+                self._update_btn.configure(text="检查更新", fg=MUTED, cursor="hand2")
+        except tk.TclError:
+            pass
+
+    # ---------------- 检查更新 ----------------
+
+    def _check_update(self, manual=False):
+        """查一次最新版本。manual=True 表示是用户点的，失败要明说。
+
+        已经查到新版时，再点一下就是「去下载」——不重复发请求，直接开下载页。
+        这个分支必须先判，否则用户看到按钮写着「去下载」，点下去却变成重新检查。
+        """
+        res = self._update_result
+        if not self._update_checking and res is not None and res.has_update:
+            self._open_release_page(res.html_url)
+            return
+        if self._update_checking:
+            return
+        self._update_checking = True
+        self._paint_update_row()
+        if manual:
+            self._set_status("正在检查更新…", MUTED, 0)
+
+        def on_done(result):
+            # 这里在后台线程！只入队，绝不去碰任何 tkinter 对象
+            try:
+                self._updates.put_nowait(result)
+            except Exception:
+                pass
+
+        try:
+            update_mod.check_async(on_done)
+        except Exception as exc:
+            self._update_checking = False
+            self._update_result = update_mod.UpdateInfo(
+                update_mod.NETWORK, "检查更新时出错：%r" % (exc,))
+            self._paint_update_row()
+            if manual:
+                self._set_status("检查更新时出错：%r" % (exc,), ERR, 6000)
+
+    def _drain_updates(self):
+        """主线程取后台线程的检查结果。"""
+        if not self._alive:
+            return
+        try:
+            while True:
+                result = self._updates.get_nowait()
+                self._on_update_result(result)
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
+        try:
+            self.root.after(200, self._drain_updates)
+        except Exception:
+            pass
+
+    def _on_update_result(self, result):
+        """拿到结果：刷界面、必要时弹托盘气泡。"""
+        self._update_checking = False
+        self._update_result = result
+        self._paint_update_row()
+
+        if result.has_update:
+            line = update_mod.summary_line(result, 120)
+            msg = "%s → %s" % (result.current, result.latest)
+            if line:
+                msg += "\n" + line
+            self._set_status(
+                "有新版本 %s，点「去下载」" % result.latest, TEAL, 12000)
+            # 收在托盘里的时候窗口看不见，必须用气泡声告知一声
+            self._notify_tray("发现新版本 %s" % result.latest, msg)
+            return
+
+        if result.status == update_mod.UP_TO_DATE:
+            self._set_status("已是最新版本（v%s）" % version.VERSION, TEAL, 5000)
+        elif result.status == update_mod.NOT_FOUND:
+            # 仓库还是私有的，匿名请求拿不到任何东西。别把它说成「网络故障」
+            self._set_status(
+                "读不到发布信息：仓库还没公开（这不影响使用）", MUTED, 8000)
+        else:
+            self._set_status("检查更新失败：%s" % (result.message or "未知原因"),
+                             WARN, 6000)
+
+    def _maybe_auto_check_update(self):
+        """启动时自动查一次，一天只查一次。
+
+        为什么不每次启动都查：匿名调 api.github.com 限 60 次/小时（按 IP），
+        用户一天开关十几次就把额度用完了，真需要查的时候反而 403。
+        查过就记下日期，同一天再启动直接跳过。
+        用户关掉开关（update_check=false）就完全不查。
+        """
+        if not _as_bool(self.cfg.get("update_check", True), True):
+            return
+        today = time.strftime("%Y-%m-%d")
+        if self._update_last_day == today:
+            return
+        self._update_last_day = today
+        self.cfg["update_last_day"] = today
+        self._save()
+        self._check_update(manual=False)
+
+    def _open_release_page(self, url=None):
+        """用系统默认浏览器打开下载页。"""
+        target = url or update_mod.RELEASES_PAGE
+        try:
+            os.startfile(target)
+        except Exception as exc:
+            # 打不开就把地址塞进剪切板，至少用户能自己粘到浏览器里
+            try:
+                clipwin.write_text(target)
+                self._set_status("打不开浏览器，下载地址已复制：%s" % target, WARN, 8000)
+            except Exception:
+                self._set_status("打不开下载页：%r" % (exc,), WARN, 8000)
+
     def _open_config_dir(self):
         """在资源管理器里打开配置所在目录。"""
         folder = config_dir()
@@ -1266,6 +1492,8 @@ class BinFloater:
         self.cfg["topmost"] = True
         self.cfg["alpha"] = 1.0
         self.cfg["width"] = W_WIDTH
+        self._update_auto = True
+        self.cfg["update_check"] = True
         self._save()
         try:
             self.root.attributes("-topmost", True)
@@ -1286,6 +1514,7 @@ class BinFloater:
         self._paint_separator_btn()
         self._paint_pause_btn()
         self._paint_auto_btn()
+        self._paint_auto_update_btn()
         self._on_input()
         self.pin_btn.configure(fg=TEAL, text="◉")
         self._refresh_tray_tooltip()

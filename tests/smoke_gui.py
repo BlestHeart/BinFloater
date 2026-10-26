@@ -522,6 +522,118 @@ _d2 = _tf.mkdtemp(prefix="binfloater_drop_")
 app._load_dropped(_d2)
 check("拖文件夹有提示", "文件夹" in app.status.cget("text"),
       app.status.cget("text"))
+
+# ---------- 检查更新 ----------
+print()
+print("== 检查更新 ==")
+import update as update_mod
+import version as version_mod
+
+check("版本行控件已建", app._update_lbl is not None and app._update_btn is not None)
+check("版本行显示当前版本", version_mod.VERSION in app._update_lbl.cget("text"),
+      app._update_lbl.cget("text"))
+check("自动检查开关已建", app.update_auto_btn is not None)
+check("自动检查默认开", app._update_auto is True, app._update_auto)
+
+# 初始态：没查过，按钮叫「检查更新」
+app._update_result = None
+app._update_checking = False
+app._paint_update_row()
+check("初始按钮文案", app._update_btn.cget("text") == "检查更新",
+      app._update_btn.cget("text"))
+
+# 查到新版：文字要点出新版本号，按钮变「去下载」
+app._on_update_result(update_mod.UpdateInfo(
+    update_mod.OK, latest="v9.9.9", current=version_mod.VERSION,
+    body="# 更新\n- 修了 A", html_url="https://example.com/dl"))
+check("查到新版时文字带新版本号", "v9.9.9" in app._update_lbl.cget("text"),
+      app._update_lbl.cget("text"))
+check("查到新版时按钮变去下载", app._update_btn.cget("text") == "去下载",
+      app._update_btn.cget("text"))
+check("查到新版时文字用亮色", app._update_lbl.cget("fg") == gui.TEAL,
+      app._update_lbl.cget("fg"))
+check("查到新版时状态栏有提示", "新版本" in app.status.cget("text"),
+      app.status.cget("text"))
+
+# 点「去下载」不应该重新发请求，而是直接开网页（这里拦掉 startfile）
+_opened = []
+_orig_startfile = os.startfile
+os.startfile = lambda p: _opened.append(p)
+try:
+    app._check_update(manual=True)
+    check("去下载直接开网页", _opened == ["https://example.com/dl"], _opened)
+    check("去下载不重置成检查中", app._update_checking is False)
+finally:
+    os.startfile = _orig_startfile
+
+# 已是最新：按钮回到「检查更新」
+app._on_update_result(update_mod.UpdateInfo(
+    update_mod.UP_TO_DATE, "已经是最新版本", latest="v1.0.0",
+    current=version_mod.VERSION))
+check("已是最新时文字", "已是最新" in app._update_lbl.cget("text"),
+      app._update_lbl.cget("text"))
+check("已是最新时按钮回到检查更新",
+      app._update_btn.cget("text") == "检查更新", app._update_btn.cget("text"))
+
+# 仓库没公开（404）：别说成「网络故障」，要直说读不到
+app._on_update_result(update_mod.UpdateInfo(
+    update_mod.NOT_FOUND, "仓库还没公开，读不到发布信息"))
+check("没公开时文字说清楚", "还没公开" in app._update_lbl.cget("text"),
+      app._update_lbl.cget("text"))
+check("没公开时状态栏也不当成网络错误",
+      "网络" not in app.status.cget("text"), app.status.cget("text"))
+
+# 网络失败：原因要原样透出来，不能只说「检查失败」
+app._on_update_result(update_mod.UpdateInfo(
+    update_mod.NETWORK, "连不上 GitHub：timed out"))
+check("网络失败带原因", "timed out" in app.status.cget("text"),
+      app.status.cget("text"))
+
+# 自动检查开关能关，且写进配置
+app._toggle_auto_update()
+check("关掉自动检查", app._update_auto is False)
+check("关掉后写配置", app.cfg.get("update_check") is False, app.cfg.get("update_check"))
+check("关掉后按钮文案", "关" in app.update_auto_btn.cget("text"),
+      app.update_auto_btn.cget("text"))
+app._toggle_auto_update()
+check("再开回来", app._update_auto is True and app.cfg.get("update_check") is True)
+
+# 关掉开关时 _maybe_auto_check_update 不应该发请求
+app.cfg["update_check"] = False
+_called = []
+_orig_check = app._check_update
+app._check_update = lambda manual=False: _called.append(manual)
+try:
+    app._maybe_auto_check_update()
+    check("关掉后启动不自动查", _called == [], _called)
+    # 打开开关，但今天已经查过，也不该再查
+    app.cfg["update_check"] = True
+    app._update_last_day = time.strftime("%Y-%m-%d")
+    app._maybe_auto_check_update()
+    check("同一天不重复查", _called == [], _called)
+    # 换成昨天，应该会查一次（而且不弹手动提示）
+    app._update_last_day = "1970-01-01"
+    app._maybe_auto_check_update()
+    check("换天后会查一次", _called == [False], _called)
+    check("查过就记下日期", app._update_last_day == time.strftime("%Y-%m-%d"),
+          app._update_last_day)
+finally:
+    app._check_update = _orig_check
+    app.cfg["update_check"] = True
+    app._update_auto = True
+    app._paint_auto_update_btn()
+
+# 后台线程 → 队列 → 主线程，这条通道要通。
+# 用的是假数据，只验证队列能取到东西、状态被重置。
+app._update_result = None
+app._update_checking = True
+app._updates.put_nowait(update_mod.UpdateInfo(
+    update_mod.NETWORK, "假失败"))
+app._drain_updates()
+check("队列结果被处理", app._update_checking is False)
+check("队列结果进了状态", app._update_result is not None
+      and app._update_result.message == "假失败")
+
 try:
     import shutil as _sh
     _sh.rmtree(_d, ignore_errors=True)

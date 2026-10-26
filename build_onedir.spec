@@ -25,7 +25,7 @@ a = Analysis(
     # 不列进来的话打包后的 exe 双击第二遍会 ImportError、唤不回窗口。
     # version 被 main.py 正常 import，静态分析能找到，但显式列出来更保险。
     hiddenimports=["clipwin", "core", "gui", "keys", "trigger", "tray",
-                   "hotkey", "wakeup", "version"],
+                   "hotkey", "wakeup", "version", "update"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
