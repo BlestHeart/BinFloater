@@ -1381,7 +1381,30 @@ class TestUpdate(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_download_wiring(self):
+    def test_auto_update_switch(self):
+        """自动检查更新的开关：默认开、能关、关了真的不发请求。"""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        g = open(os.path.join(root, "gui.py"), encoding="utf-8").read()
+        # 默认值必须是「开」，且从配置读
+        self.assertIn('_as_bool(self.cfg.get("update_check", True), True)', g)
+        # 关闭时必须直接 return，不能只是「少查一次」
+        self.assertIn("if not _as_bool(self.cfg.get(\"update_check\", True), True):", g)
+        self.assertIn("def _maybe_auto_check_update", g)
+        self.assertIn("def _toggle_auto_update", g)
+        # 开关要写进配置，不然重启又开回来了
+        self.assertIn('self.cfg["update_check"] = self._update_auto', g)
+        # 「恢复默认」要把开关也恢复成开
+        self.assertIn('self.cfg["update_check"] = True', g)
+        # 开关控件必须在设置卡片的标题行（top）里，不能铺在卡片底部：
+        # 卡片比一屏高，铺在底部就要滚动才看得到（真踩过）
+        head_idx = g.find('self.update_auto_btn.pack(side="right"')
+        ver_idx = g.find('text="版本"')
+        self.assertTrue(head_idx > 0, "没找到开关的 pack 调用")
+        self.assertTrue(ver_idx > 0, "没找到版本行")
+        self.assertLess(head_idx, ver_idx,
+                        "自动检查开关应当在版本行之前（标题行里）")
+
+
         """静态检查应用内下载的几条硬规则还在。"""
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         g = open(os.path.join(root, "gui.py"), encoding="utf-8").read()

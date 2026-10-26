@@ -745,12 +745,65 @@ finally:
     except Exception:
         pass
 
-# 自动检查开关能关，且写进配置
+# 自动检查开关：既要在配置里真的生效，又要在界面上看得见
+#
+# 「看不见」是个真踩过的坑：这两行最初铺在设置卡片最下面，而卡片内容
+# 已经比一屏高，要滚下去才能看到——想关的人恰恰是最先需要看到它的人。
+# 现在挪到设置卡片的标题行，跟「恢复默认」并排。
+from gui import _as_bool as _as_bool_fn
+
+# 1) 真实配置值能左右启动时的初值
+check("_as_bool 认字符串 false",
+      _as_bool_fn("false", True) is False, _as_bool_fn("false", True))
+check("_as_bool 认字符串 0",
+      _as_bool_fn("0", True) is False, _as_bool_fn("0", True))
+check("_as_bool 垃圾值回默认",
+      _as_bool_fn("不知道", True) is True, _as_bool_fn("不知道", True))
+
+# 2) 开关控件真的在可视区内，不用滚动就能看到（踩过的坑）
+_canvas_top = app.canvas.winfo_rooty()
+_canvas_bottom = _canvas_top + app.canvas.winfo_height()
+
+
+def _on_screen(w):
+    ry, rh = w.winfo_rooty(), w.winfo_height()
+    return (rh > 0 and _canvas_top <= ry and ry + rh <= _canvas_bottom)
+
+
+check("自动检查开关在可视区内", _on_screen(app.update_auto_btn))
+check("检查更新按钮在可视区内", _on_screen(app._update_btn))
+check("版本提示在可视区内", _on_screen(app._update_lbl))
+
+# 3) 两种状态的文案：关掉时必须一眼看出不联网
+app._update_auto = True
+app._paint_auto_update_btn()
+check("开着文案", app.update_auto_btn.cget("text") == "自动检查 开",
+      app.update_auto_btn.cget("text"))
+app._update_auto = False
+app._paint_auto_update_btn()
+check("关着文案写明不联网",
+      "不联网" in app.update_auto_btn.cget("text"),
+      app.update_auto_btn.cget("text"))
+
+# 4) 点开关真的会翻、并写盘
+app._update_auto = True
+app._paint_auto_update_btn()
 app._toggle_auto_update()
 check("关掉自动检查", app._update_auto is False)
 check("关掉后写配置", app.cfg.get("update_check") is False, app.cfg.get("update_check"))
 check("关掉后按钮文案", "关" in app.update_auto_btn.cget("text"),
       app.update_auto_btn.cget("text"))
+
+# 5) 关掉的当下把已有的检查结果清掉，别再刷一个「发现新版本」骚扰用户
+app._update_result = update_mod.UpdateInfo(
+    update_mod.OK, latest="v9.9.9", current=version_mod.VERSION)
+app._paint_update_row()
+app._update_auto = True
+app._toggle_auto_update()      # -> 关
+check("关掉时清掉旧结果", app._update_result is None, app._update_result)
+check("关掉后按钮回到检查更新",
+      app._update_btn.cget("text") == "检查更新", app._update_btn.cget("text"))
+
 app._toggle_auto_update()
 check("再开回来", app._update_auto is True and app.cfg.get("update_check") is True)
 

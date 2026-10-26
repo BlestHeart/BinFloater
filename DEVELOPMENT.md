@@ -78,14 +78,14 @@ bash build_installer.sh --no-build   # 只重新生成安装包，用现有 dist
 ```bash
 python tests/test_all.py       # 143 项：编解码四种格式 + 格式识别 + 触发逻辑 + 快捷键解析 + 版本号 + 检查更新 + 应用内下载 + 源码约定
 python tests/test_config.py    #  64 项：配置原子写盘、坏文件备份、类型校验、错误日志、配置目录选择、安装脚本
-python tests/smoke_gui.py      # 188 项：真建窗口，控件、钩子、托盘、历史、滑块、录制回显、长文本保护、检查更新、应用内下载
+python tests/smoke_gui.py      # 198 项：真建窗口，控件、钩子、托盘、历史、滑块、录制回显、长文本保护、检查更新、应用内下载、自动检查开关可见性
 python tests/e2e_convert.py    #  23 项：真 Win32 窗口，真按键、真粘贴、选区边界
 python tests/e2e_notepad.py    #   9 项：开真记事本，验证剪切板还原
 python tests/e2e_roundtrip.py  #  18 项：文字 → 二进制 → 文字 往返（含超长会换行的）
 python tests/install_check.py  #  12 项：真装一遍、启动、优雅退出、卸载，核对装到非 C 盘
 ```
 
-合计 445 项（含安装实测 12 项）。`e2e_*.py` 会真的动键盘和剪切板，
+合计 455 项（含安装实测 12 项）。`e2e_*.py` 会真的动键盘和剪切板，
 `install_check.py` 会真的往你的 D 盘装一份再卸掉，跑之前先把正在编辑的东西存一下。
 
 `smoke_gui.py` 和 `test_config.py` 都会把 `BINF_CONFIG_DIR` / `APPDATA` 指到临时目录
@@ -193,9 +193,14 @@ pystray 不支持气泡通知（`NIF_INFO`），而「收进托盘时告诉用�
 
 - **一天只查一次。** 匿名调 `api.github.com` 限 60 次/小时（按 IP）。查过就把
   日期写进 `update_last_day`，同一天再启动直接跳过。
+- **默认开，但必须能关。** 见下面「开关」一段。
 - **后台线程只入队，不碰 Tk。** `_check_update` 把回调包成往 `self._updates`
   里 `put_nowait`，主线程 `_drain_updates` 每 200ms 取。进度和下载结果同样走
   各自队列（`_update_progress_queue` / `_update_dl_queue`）。
+- **能在设置里关掉。** 开关在设置卡片的**标题行**（不是铺在下面）：卡片内容
+  已比一屏高，铺底部要滚动才看得到，而想关它的人恰恰最需要第一时间找到。
+  关掉后 `update_check=false`，`_maybe_auto_check_update` 直接 return，
+  一次请求都不发；重启也从配置读回来，不会自己开回去。
 - **draft / prerelease 不推给普通用户。** `/releases/latest` 本身已经排除，
   但代码里再挡一道，以后换接口不会踩。
 
@@ -229,6 +234,38 @@ pystray 不支持气泡通知（`NIF_INFO`），而「收进托盘时告诉用�
 
 安装包下载到 `config_dir()/updates/`，`BINF_DOWNLOAD_DIR` 环境变量可以覆盖
 （测试靠它隔离）。
+
+### 自动检查开关
+
+`update_check` 是唯一总闸，三处必须同时成立才算「真关」：
+
+1. **默认值**：`_as_bool(self.cfg.get("update_check", True), True)` —— 缺键时
+   当开（新装用户默认能收到更新提醒）。用 `_as_bool` 而不是 `bool()`：字符串
+   `"false"` 在 Python 里是真值，用户手改配置写成 `"false"` 反而会把开关打开。
+2. **执行处**：`_maybe_auto_check_update` 开头就 `if not ...: return` —— 不是
+   「少查一次」，而是整个函数不进。`_check_update` 只有手动点按钮才会调。
+3. **开关自己写盘**：`_toggle_auto_update` 里 `self.cfg["update_check"] =
+   self._update_auto` + `_save()`，重启从配置读回来，不会自己开回去。
+
+实测（假 `check_async` 计数器 + 真实 GUI 起 5 秒）：
+
+| 配置 | 启动后请求次数 |
+|---|---|
+| 无配置文件（默认） | 1 |
+| `update_check: false` | **0** |
+| `update_check: true` | 1 |
+| `update_check: "false"`（手改成字符串） | **0** |
+| `update_check: "不知道"`（垃圾值） | 1（回退默认） |
+
+**UI 位置也是需求的一部分**。最初这个开关铺在设置卡片最下面，而卡片内容
+（`body_req` 约 1025px）已超过一屏可视区（`canvas` 约 898px），要滚动才看
+得到——“不想让程序联网”的人恰恰是最需要第一眼看到它的人。现在放在设置
+卡片标题行，跟「恢复默认」并排。`smoke_gui.py` 里有一条断言比对
+`winfo_rooty` 和 canvas 可视区，`test_all.py` 里有一条断言它出现在版本行
+之前，两道防线。
+
+另外，关掉的当下会把 `_update_result` 清掉并重刷版本行：避免刚好在跑的
+那一轮查完之后还跳一个「发现新版本」出来骚扰人。
 
 ## 踩过的坑
 

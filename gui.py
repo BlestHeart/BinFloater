@@ -1134,6 +1134,43 @@ class BinFloater:
         self.reset_btn.bind("<Leave>",
                             lambda e: self.reset_btn.configure(fg=MUTED))
 
+        # 自动检查更新的开关。放在设置卡片的标题行里，而不是往下铺一行：
+        # 卡片内容现在比一屏高，铺在下面的行要滚下去才看得到，而「不想让
+        # 程序联网」的人恰恰是最需要第一眼就能找到这个关的人。
+        self.update_auto_btn = tk.Label(top, bg=CARD_HI, font=self.font_meta,
+                                        padx=7, pady=2, cursor="hand2")
+        self.update_auto_btn.pack(side="right", padx=(0, 8))
+        self.update_auto_btn.bind("<Button-1>", lambda e: self._toggle_auto_update())
+        self.update_auto_btn.bind("<Enter>",
+                                  lambda e: self.update_auto_btn.configure(bg=STROKE))
+        self.update_auto_btn.bind("<Leave>",
+                                  lambda e: self.update_auto_btn.configure(bg=CARD_HI))
+        self._update_auto = _as_bool(self.cfg.get("update_check", True), True)
+        self._paint_auto_update_btn()
+
+        # ---------------------------------------------------------------
+        # 版本行。紧跟标题，一看就知道当前装的哪版。
+        # ---------------------------------------------------------------
+        vrow = tk.Frame(card, bg=CARD)
+        vrow.pack(fill="x", padx=12, pady=(0, 8))
+        tk.Label(vrow, text="版本", bg=CARD, fg=MUTED,
+                 font=self.font_meta, width=6, anchor="w").pack(side="left")
+        self._update_btn = tk.Label(
+            vrow, text="检查更新", bg=CARD_HI, fg=MUTED,
+            font=self.font_meta, padx=8, pady=2, cursor="hand2",
+        )
+        self._update_btn.pack(side="right")
+        self._update_btn.bind("<Button-1>", lambda e: self._check_update(manual=True))
+        self._update_btn.bind("<Enter>",
+                              lambda e: self._update_btn.configure(fg=ACCENT))
+        self._update_btn.bind("<Leave>",
+                              lambda e: self._update_btn.configure(fg=self._update_btn_fg()))
+        self._update_lbl = tk.Label(
+            vrow, text=self._version_text(), bg=CARD, fg=MUTED,
+            font=self.font_meta, anchor="w", justify="left",
+        )
+        self._update_lbl.pack(side="left", fill="x", expand=True, padx=(4, 6))
+
         arow = tk.Frame(card, bg=CARD)
         arow.pack(fill="x", padx=12, pady=(0, 8))
         tk.Label(arow, text="不透明度", bg=CARD, fg=MUTED,
@@ -1192,49 +1229,18 @@ class BinFloater:
         self.cfg_path_lbl.bind("<Leave>",
                                lambda e: self.cfg_path_lbl.configure(fg=MUTED))
 
-        # 版本与更新。用户提的「能不能做自动检查更新」就落在这一行：
-        # 左边显示当前版本 + 检查结果，右边一个按钮手动再查一次。
-        vrow = tk.Frame(card, bg=CARD)
-        vrow.pack(fill="x", padx=12, pady=(0, 10))
-        tk.Label(vrow, text="版本", bg=CARD, fg=MUTED,
-                 font=self.font_meta, width=6, anchor="w").pack(side="left")
-        self._update_btn = tk.Label(
-            vrow, text="检查更新", bg=CARD_HI, fg=MUTED,
-            font=self.font_meta, padx=8, pady=2, cursor="hand2",
-        )
-        self._update_btn.pack(side="right")
-        self._update_btn.bind("<Button-1>", lambda e: self._check_update(manual=True))
-        self._update_btn.bind("<Enter>",
-                              lambda e: self._update_btn.configure(fg=ACCENT))
-        self._update_btn.bind("<Leave>",
-                              lambda e: self._update_btn.configure(fg=self._update_btn_fg()))
-        self._update_lbl = tk.Label(
-            vrow, text=self._version_text(), bg=CARD, fg=MUTED,
-            font=self.font_meta, anchor="w", justify="left",
-        )
-        self._update_lbl.pack(side="left", fill="x", expand=True, padx=(4, 6))
-
-        # 自动检查开关。默认开，但得能关：有人就是不想让程序联网。
-        crow = tk.Frame(card, bg=CARD)
-        crow.pack(fill="x", padx=12, pady=(0, 10))
-        tk.Label(crow, text="更新", bg=CARD, fg=MUTED,
-                 font=self.font_meta, width=6, anchor="w").pack(side="left")
-        self.update_auto_btn = tk.Label(crow, bg=CARD_HI, font=self.font_meta,
-                                        padx=8, pady=2, cursor="hand2")
-        self.update_auto_btn.pack(side="left", padx=(4, 6))
-        self.update_auto_btn.bind("<Button-1>", lambda e: self._toggle_auto_update())
-        tk.Label(crow, text="每天启动查一次", bg=CARD, fg=MUTED,
-                 font=self.font_meta, anchor="w").pack(side="left")
-        self._update_auto = _as_bool(self.cfg.get("update_check", True), True)
-        self._paint_auto_update_btn()
-
     def _paint_auto_update_btn(self):
+        """自动检查开关的样子。
+
+        关掉时必须一眼看出「不联网」，不能只写一个「关」：用户不确定程序
+        是不是还在背后偷偷查。标题行位置有限，提示写成括号缀在按钮上。
+        """
         try:
             if self._update_auto:
                 self.update_auto_btn.configure(text="自动检查 开", fg=TEAL)
             else:
-                self.update_auto_btn.configure(text="自动检查 关", fg=MUTED)
-        except tk.TclError:
+                self.update_auto_btn.configure(text="自动检查 关（不联网）", fg=WARN)
+        except (tk.TclError, AttributeError):
             pass
 
     def _toggle_auto_update(self):
@@ -1245,7 +1251,12 @@ class BinFloater:
         if self._update_auto:
             self._set_status("已开启自动检查更新（每天启动时查一次）", TEAL, 5000)
         else:
-            self._set_status("已关闭自动检查更新，需要时点「检查更新」", MUTED, 5000)
+            self._set_status(
+                "已关闭自动检查：之后不会再联网，想查得自己点「检查更新」",
+                MUTED, 6000)
+            # 关掉的当下如果恰好有一轮检查在跑，把结果丢掉，别再骚扰用户
+            self._update_result = None
+            self._paint_update_row()
 
     def _update_btn_fg(self):
         """「检查更新」按钮该用什么颜色：查到新版用亮色提醒。"""
