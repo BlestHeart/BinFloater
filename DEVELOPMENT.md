@@ -69,23 +69,23 @@ bash build_installer.sh --no-build   # 只重新生成安装包，用现有 dist
 | `tray.py` | 系统托盘 + 气泡通知（ctypes 自绘） |
 | `wakeup.py` | 命名事件，第二个实例把已有窗口叫回来 |
 | `version.py` | 版本号唯一来源，安装器和 `--version` 都读它 |
-| `update.py` | 检查更新：问 GitHub Releases API，只返回结果不碰界面 |
+| `update.py` | 检查更新 + 应用内下载安装包：网络、sha256 校验、原子落盘全在这里，不碰界面 |
 
 只有 `gui.py` 碰 tkinter，其余模块都能在纯命令行下单独跑。
 
 ## 测试
 
 ```bash
-python tests/test_all.py       # 136 项：编解码四种格式 + 格式识别 + 触发逻辑 + 快捷键解析 + 版本号 + 检查更新 + 源码约定
+python tests/test_all.py       # 143 项：编解码四种格式 + 格式识别 + 触发逻辑 + 快捷键解析 + 版本号 + 检查更新 + 应用内下载 + 源码约定
 python tests/test_config.py    #  64 项：配置原子写盘、坏文件备份、类型校验、错误日志、配置目录选择、安装脚本
-python tests/smoke_gui.py      # 168 项：真建窗口，控件、钩子、托盘、历史、滑块、录制回显、长文本保护、检查更新
+python tests/smoke_gui.py      # 188 项：真建窗口，控件、钩子、托盘、历史、滑块、录制回显、长文本保护、检查更新、应用内下载
 python tests/e2e_convert.py    #  23 项：真 Win32 窗口，真按键、真粘贴、选区边界
 python tests/e2e_notepad.py    #   9 项：开真记事本，验证剪切板还原
 python tests/e2e_roundtrip.py  #  18 项：文字 → 二进制 → 文字 往返（含超长会换行的）
 python tests/install_check.py  #  12 项：真装一遍、启动、优雅退出、卸载，核对装到非 C 盘
 ```
 
-合计 418 项（含安装实测 12 项）。`e2e_*.py` 会真的动键盘和剪切板，
+合计 445 项（含安装实测 12 项）。`e2e_*.py` 会真的动键盘和剪切板，
 `install_check.py` 会真的往你的 D 盘装一份再卸掉，跑之前先把正在编辑的东西存一下。
 
 `smoke_gui.py` 和 `test_config.py` 都会把 `BINF_CONFIG_DIR` / `APPDATA` 指到临时目录
@@ -184,23 +184,51 @@ Windows 有 `LowLevelHooksTimeout`（默认 300ms）。回调超时会被系统
 pystray 不支持气泡通知（`NIF_INFO`），而「收进托盘时告诉用户触发还能用」
 正靠它。
 
-### 检查更新只提醒、不自动替换
+### 检查更新 + 应用内下载
 
-`update.py` 只负责「问一次 GitHub → 返回一个结果对象」，不碰 tkinter，
-也不下载任何东西。三个约束写成了硬规则：
+`update.py` 分两层：检查（`fetch` / `parse_release`）和下载（`download_asset`），
+两层都只返回结果对象，不碰 tkinter。
 
-- **不自己替换 exe。** onedir 分发时 `BinFloater.exe` 和 `_internal` 里的 dll
-  都被当前进程占用，Windows 不允许改写正在运行的映像。先退出再换得靠外部脚本
-  蹲着等进程结束，而这种行为在装了 360 / 火绒的机器上大概率被拦，且拦了用户
-  什么提示都看不到。升级走安装包双击覆盖。
+检查侧三个硬规则：
+
 - **一天只查一次。** 匿名调 `api.github.com` 限 60 次/小时（按 IP）。查过就把
   日期写进 `update_last_day`，同一天再启动直接跳过。
-- **后台线程只入队，不碰 Tk。** Tk 不是线程安全的。`_check_update` 把回调包成
-  「往 `self._updates` 里 `put_nowait`」，主线程 `_drain_updates` 每 200ms 取。
+- **后台线程只入队，不碰 Tk。** `_check_update` 把回调包成往 `self._updates`
+  里 `put_nowait`，主线程 `_drain_updates` 每 200ms 取。进度和下载结果同样走
+  各自队列（`_update_progress_queue` / `_update_dl_queue`）。
+- **draft / prerelease 不推给普通用户。** `/releases/latest` 本身已经排除，
+  但代码里再挡一道，以后换接口不会踩。
 
 私有仓库的匿名请求会得到 404（GitHub 不区分「不存在」和「没权限」），所以 404
 单独归成 `NOT_FOUND`，界面上写「仓库还没公开」而不是「网络故障」——后者会让人
 去查防火墙，方向全错。
+
+下载侧四个必做的事：
+
+- **先写 `.part`，验过才 `os.replace` 改成真名。** 半途断网不会留下一个看着像
+  安装包、双击却报「文件损坏」的碎文件，也不会把已经下好的那份弄坏。
+- **边下边算 sha256。** GitHub 从 2024 年起给每个 asset 返回 `digest` 字段
+  （`sha256:...`），白送的完整性校验。对不上就删 `.part` 并报 `DL_BAD_HASH`。
+- **卡大小上限。** `Content-Length` 声明超过 `MAX_DOWNLOAD_BYTES`（200MB）
+  直接不下；下到一半超了也立刻停，防重定向到一个无限流把磁盘写满。
+- **可取消。** `should_stop` 每读一块查一次，用户点取消立刻跳出来删 `.part`。
+
+### 为什么「应用内下载」可以，但「自己替换自己」不行
+
+这是两个不同的事，之前混在一起才得出了「只能跳浏览器」的结论：
+
+- **自己替换自己不行**：程序跑着时 `BinFloater.exe` 和 `_internal` 里的 dll
+  都被占用，Windows 不允许改写正在运行的映像。先退出再换得靠外部脚本蹲着等
+  进程结束，而这种行为在装了 360 / 火绒的机器上大概率被拦，拦了还没提示。
+- **下载安装包 + 拉起安装程序可以**：真正动手覆盖文件的是 Inno Setup，不是
+  我们。我们要做的只是先把自己完整关掉（`_launch_installer` 里 `os.replace`
+  之前就 `after(400, self._quit)`），把位置让出来。
+
+`_launch_installer` 用 `DETACHED_PROCESS` 拉起安装程序：不脱离父进程的话，
+我们退出时安装向导可能被一起带走，UAC 提权对话框都弹不出来。
+
+安装包下载到 `config_dir()/updates/`，`BINF_DOWNLOAD_DIR` 环境变量可以覆盖
+（测试靠它隔离）。
 
 ## 踩过的坑
 
@@ -236,3 +264,11 @@ pystray 不支持气泡通知（`NIF_INFO`），而「收进托盘时告诉用�
 - **查 PYZ 里有没有某函数，`repr(module_object)` 是不行的**：要递归走
   `co_consts` 和 `co_names` 收集字符串。直接对模块对象做 `repr` 再看关键字
   全是 False，容易误判成「没打包进去」。
+- **测试里等后台线程结果时别 `root.update()`**：那会把主循环跑起来，而
+  `_drain_updates` 是靠 `after(200)` 自动跑的，它会先把队列里的结果吃掉并
+  调好处理函数——测试自己就永远取不到了，跑到超时才死。只 poll 队列，拿到
+  后自己调一次处理函数，行为才确定（`smoke_gui.py` 里写了注释）。
+- **测试脚本顶层变量名别随便占**：`smoke_gui.py` 顶层 `ok` / `bad` 是
+  通过/失败的列表，中间用 `bad = update.download_asset(...)` 会把它覆盖成
+  一个结果对象，后面 `check()` 去 `.append` 就报
+  `AttributeError: 'DownloadResult' object has no attribute 'append'`。

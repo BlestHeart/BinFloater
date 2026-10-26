@@ -20,7 +20,9 @@
   "not_found"，界面上说清楚是「仓库还没公开」，而不是「连不上网」。
 """
 
+import hashlib
 import json
+import os
 import threading
 import urllib.error
 import urllib.request
@@ -48,15 +50,84 @@ HTTP_ERROR = "http_error"  # 其他 4xx/5xx
 NETWORK = "network"        # 连不上、超时、DNS、代理挂了
 BAD_JSON = "bad_json"      # 拿回来的不是预期结构
 
+# 下载安装包时的状态码（和检查更新分开，两边语义不一样）
+DL_OK = "dl_ok"
+DL_NETWORK = "dl_network"
+DL_HTTP = "dl_http"
+DL_TOO_BIG = "dl_too_big"
+DL_BAD_HASH = "dl_bad_hash"
+DL_DISK = "dl_disk"
+DL_CANCELLED = "dl_cancelled"
+
+# 只认这两种资产名。旧版 Release 只有 zip，没有 Setup.exe，也要能处理。
+ASSET_SETUP = "setup"
+ASSET_ZIP = "zip"
+
+# 安装包下载上限。现在是 10MB 上下，给 200MB 够宽松，但能挡住「服务器
+# 返回一个无限流」把磁盘写满。
+MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
+
+
+class Asset(object):
+    """Release 里的一个附件。只需要下载安装包，所以字段挑着拿。"""
+
+    __slots__ = ("name", "size", "url", "digest")
+
+    def __init__(self, name, size=0, url="", digest=""):
+        self.name = name
+        self.size = int(size or 0)
+        self.url = url
+        self.digest = digest or ""
+
+    @property
+    def is_setup(self):
+        """是不是安装包。大小写不敏感，兼容早期命名。"""
+        low = self.name.lower()
+        return low.endswith(".exe") and "setup" in low
+
+    @property
+    def is_zip(self):
+        return self.name.lower().endswith(".zip")
+
+    @property
+    def sha256(self):
+        """从 digest 里把十六进制抠出来。GitHub 给的是 "sha256:abc..."。"""
+        d = (self.digest or "").strip()
+        if d.lower().startswith("sha256:"):
+            return d[7:].strip().lower()
+        return d.lower()
+
+    def __repr__(self):
+        return "<Asset %r %d>" % (self.name, self.size)
+
+
+class DownloadResult(object):
+    """下载结果。path 只在成功时有值。"""
+
+    __slots__ = ("status", "path", "message", "bytes")
+
+    def __init__(self, status, path="", message="", wrote=0):
+        self.status = status
+        self.path = path
+        self.message = message
+        self.bytes = wrote
+
+    @property
+    def ok(self):
+        return self.status == DL_OK
+
+    def __repr__(self):
+        return "<DownloadResult %s %r>" % (self.status, self.path)
+
 
 class UpdateInfo(object):
     """检查结果。字段全给了默认值，调用方不用挨个判 None。"""
 
     __slots__ = ("status", "latest", "current", "name", "body",
-                 "html_url", "published_at", "message")
+                 "html_url", "published_at", "message", "assets")
 
     def __init__(self, status, message="", latest="", current=None,
-                 name="", body="", html_url="", published_at=""):
+                 name="", body="", html_url="", published_at="", assets=None):
         self.status = status
         self.message = message
         self.latest = latest
@@ -65,6 +136,21 @@ class UpdateInfo(object):
         self.body = body
         self.html_url = html_url or RELEASES_PAGE
         self.published_at = published_at
+        self.assets = list(assets or [])
+
+    def asset(self, kind):
+        """按类型挑附件。挑不到返回 None。"""
+        for a in self.assets:
+            if kind == ASSET_SETUP and a.is_setup:
+                return a
+            if kind == ASSET_ZIP and a.is_zip:
+                return a
+        return None
+
+    @property
+    def installer(self):
+        """能直接双击跑的安装包。没有就返回 None（旧版 Release 只有 zip）。"""
+        return self.asset(ASSET_SETUP)
 
     @property
     def has_update(self):
@@ -103,6 +189,27 @@ def summary_line(result, limit=400):
     return text
 
 
+def parse_assets(payload):
+    """把 Release JSON 里的 assets 数组转成 Asset 列表。"""
+    raw = payload.get("assets") if isinstance(payload, dict) else None
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        out.append(Asset(
+            name,
+            item.get("size") or 0,
+            str(item.get("browser_download_url") or ""),
+            str(item.get("digest") or ""),
+        ))
+    return out
+
+
 def parse_release(payload, current=None):
     """把 API 返回的 JSON 转成 UpdateInfo。单独拎出来是为了能离线测。"""
     current = current or version.VERSION
@@ -134,7 +241,165 @@ def parse_release(payload, current=None):
         body=str(payload.get("body") or ""),
         html_url=str(payload.get("html_url") or RELEASES_PAGE),
         published_at=str(payload.get("published_at") or ""),
+        assets=parse_assets(payload),
     )
+
+
+def download_asset(asset, folder, progress=None, should_stop=None):
+    """把附件下载到 folder，返回 DownloadResult。
+
+    四个必须做的事：
+      1. 先写 .part，校验通过才 os.replace 改成真名。半途断网不会留下一个
+         看着像安装包、双击却报「文件损坏」的碎文件。
+      2. 边下边算 sha256，下完和 Release 里声明的 digest 对。GitHub 从
+         2024 年起给每个 asset 返回 digest 字段，白送的完整性校验。
+      3. 声明了大小的就卡住上限，下超了立刻停（防重定向到一个无限流）。
+      4. progress(已写, 总数) 在后台线程里被调，调用方自己往队列里塞。
+
+    should_stop 是个无参可调用对象，返回 True 就中断（用户点了取消）。
+    """
+    if asset is None:
+        return DownloadResult(DL_HTTP, message="没有可下载的附件")
+    if not asset.url:
+        return DownloadResult(DL_HTTP, message="附件没有下载地址")
+
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except Exception as exc:
+        return DownloadResult(DL_DISK, message="建不了下载目录：%s" % (exc,))
+
+    # 文件名只取最后一段，防着服务端给个带路径的名字往外写
+    safe = os.path.basename(asset.name) or "BinFloater-Setup.exe"
+    final = os.path.join(folder, safe)
+    part = final + ".part"
+
+    req = urllib.request.Request(asset.url, method="GET")
+    req.add_header("User-Agent", USER_AGENT)
+    req.add_header("Accept", "application/octet-stream")
+
+    hasher = hashlib.sha256()
+    written = 0
+    total = asset.size
+    try:
+        resp = urllib.request.urlopen(req, timeout=READ_TIMEOUT_S)
+    except urllib.error.HTTPError as exc:
+        return DownloadResult(DL_HTTP, message="下载地址返回 HTTP %d" % (
+            int(getattr(exc, "code", 0) or 0),))
+    except Exception as exc:
+        return DownloadResult(DL_NETWORK, message="连不上下载地址：%r" % (exc,))
+
+    try:
+        try:
+            # Content-Length 可能没有（分块传输），有就用它
+            clen = resp.headers.get("Content-Length") if resp.headers else None
+            if clen:
+                try:
+                    total = max(int(clen), 0)
+                except (TypeError, ValueError):
+                    pass
+            if total > MAX_DOWNLOAD_BYTES:
+                return DownloadResult(
+                    DL_TOO_BIG, message="安装包太大（%d MB），不下了" % (
+                        total // 1048576,))
+
+            fh = open(part, "wb")
+            try:
+                while True:
+                    if should_stop is not None and should_stop():
+                        raise _Cancelled()
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > MAX_DOWNLOAD_BYTES:
+                        raise _TooBig()
+                    hasher.update(chunk)
+                    fh.write(chunk)
+                    if progress is not None:
+                        try:
+                            progress(written, total)
+                        except Exception:
+                            # 进度回调出错不能把下载搞死
+                            pass
+            finally:
+                fh.close()
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+    except _Cancelled:
+        _quiet_remove(part)
+        return DownloadResult(DL_CANCELLED, message="已取消")
+    except _TooBig:
+        _quiet_remove(part)
+        return DownloadResult(DL_TOO_BIG, message="下载超过大小上限，已中断")
+    except Exception as exc:
+        _quiet_remove(part)
+        return DownloadResult(DL_NETWORK, message="下载中断：%r" % (exc,))
+
+    # 大小对得上吗（服务端明确给了总长才查）
+    if total > 0 and written != total:
+        _quiet_remove(part)
+        return DownloadResult(
+            DL_NETWORK, message="下载不完整（%d / %d 字节）" % (written, total))
+
+    want = asset.sha256
+    if want:
+        got = hasher.hexdigest()
+        if got != want:
+            _quiet_remove(part)
+            return DownloadResult(
+                DL_BAD_HASH,
+                message="校验和不匹配（下下来的是 %s…，应该是 %s…）" % (
+                    got[:12], want[:12]))
+
+    try:
+        os.replace(part, final)
+    except Exception as exc:
+        _quiet_remove(part)
+        return DownloadResult(DL_DISK, message="存盘失败：%s" % (exc,))
+
+    return DownloadResult(DL_OK, path=final, wrote=written)
+
+
+class _Cancelled(Exception):
+    """用户点了取消。用异常是为了能从深处跳出来。"""
+
+
+class _TooBig(Exception):
+    """下超了上限。"""
+
+
+def _quiet_remove(path):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def download_async(asset, folder, callback, progress=None, should_stop=None):
+    """后台线程下载，完事回调 callback(DownloadResult)。
+
+    progress 也是后台线程里被调，调用方自己转主线程。
+    """
+
+    def run():
+        try:
+            result = download_asset(asset, folder, progress=progress,
+                                    should_stop=should_stop)
+        except Exception as exc:
+            result = DownloadResult(DL_NETWORK, message="下载出错：%r" % (exc,))
+        try:
+            callback(result)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=run, name="BinFloaterDownload")
+    t.daemon = True
+    t.start()
+    return t
 
 
 def _read_body(resp):

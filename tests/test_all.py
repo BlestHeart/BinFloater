@@ -1223,6 +1223,188 @@ class TestUpdate(unittest.TestCase):
         self.assertIn("self._updates.put_nowait(result)", g)
         self.assertIn("self.root.after(200, self._drain_updates)", g)
 
+    # ---------- 应用内下载 ----------
+
+    def test_parse_assets(self):
+        r = update_mod.parse_release({
+            "tag_name": "v9.9.9",
+            "assets": [
+                {"name": "BinFloater.zip", "size": 11,
+                 "browser_download_url": "https://x/z", "digest": "sha256:aa"},
+                {"name": "BinFloater-Setup-9.9.9.exe", "size": 22,
+                 "browser_download_url": "https://x/s",
+                 "digest": "sha256:bb"},
+                {"name": "", "size": 1},          # 没名字的跳过
+                "不是字典",                          # 不是字典的跳过
+            ],
+        })
+        self.assertEqual(len(r.assets), 2)
+        inst = r.installer
+        self.assertIsNotNone(inst)
+        self.assertEqual(inst.name, "BinFloater-Setup-9.9.9.exe")
+        self.assertEqual(inst.size, 22)
+        self.assertEqual(inst.sha256, "bb")
+        self.assertTrue(inst.is_setup)
+        self.assertFalse(inst.is_zip)
+        self.assertEqual(r.asset(update_mod.ASSET_ZIP).name, "BinFloater.zip")
+
+    def test_no_installer_in_old_release(self):
+        """早期 Release 只有 zip，installer 必须返回 None 而不是乱挑。"""
+        r = update_mod.parse_release({
+            "tag_name": "v9.9.9",
+            "assets": [{"name": "BinFloater.zip", "size": 1,
+                        "browser_download_url": "https://x/z"}],
+        })
+        self.assertIsNone(r.installer)
+        self.assertIsNotNone(r.asset(update_mod.ASSET_ZIP))
+
+    def test_asset_sha256_parsing(self):
+        self.assertEqual(
+            update_mod.Asset("a.exe", digest="sha256:ABC123").sha256, "abc123")
+        self.assertEqual(update_mod.Asset("a.exe", digest="").sha256, "")
+        # 早期/自定义格式没有前缀也要能用
+        self.assertEqual(update_mod.Asset("a.exe", digest="deadbeef").sha256,
+                         "deadbeef")
+
+    def test_download_against_local_server(self):
+        """本地假服务跑一遍下载：成功、校验和不匹配、取消、404。"""
+        import hashlib
+        import http.server
+        import threading
+
+        payload = b"MZ" + b"\x00" * 300000
+        digest = hashlib.sha256(payload).hexdigest()
+        mode = {"v": "ok"}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if mode["v"] == "404":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port = srv.server_address[1]
+        th = threading.Thread(target=srv.serve_forever)
+        th.daemon = True
+        th.start()
+        url = "http://127.0.0.1:%d/s.exe" % port
+
+        # 本地回环不能走代理（系统里可能配着代理），换成空 ProxyHandler
+        saved = {}
+        for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+            saved[k] = os.environ.pop(k, None)
+        import urllib.request as urlreq
+        urlreq.install_opener(urlreq.build_opener(urlreq.ProxyHandler({})))
+        tmp = tempfile.mkdtemp(prefix="binfloater_dl_")
+        try:
+            # 成功
+            good = update_mod.download_asset(
+                update_mod.Asset("BinFloater-Setup-9.9.9.exe", len(payload),
+                                 url, "sha256:" + digest), tmp)
+            self.assertEqual(good.status, update_mod.DL_OK, good.message)
+            self.assertTrue(os.path.isfile(good.path))
+            with open(good.path, "rb") as fh:
+                self.assertEqual(fh.read(), payload)
+            # 不能留下 .part
+            self.assertFalse(os.path.exists(good.path + ".part"))
+            self.assertEqual(good.bytes, len(payload))
+
+            # 校验和不匹配 -> 不落盘也不破坏已有文件
+            before = open(good.path, "rb").read()
+            bad = update_mod.download_asset(
+                update_mod.Asset("BinFloater-Setup-9.9.9.exe", len(payload),
+                                 url, "sha256:" + "0" * 64), tmp)
+            self.assertEqual(bad.status, update_mod.DL_BAD_HASH)
+            self.assertEqual(open(good.path, "rb").read(), before)
+            self.assertFalse(os.path.exists(good.path + ".part"))
+
+            # 取消
+            cancelled = update_mod.download_asset(
+                update_mod.Asset("x.exe", len(payload), url, ""),
+                tmp, should_stop=lambda: True)
+            self.assertIn(cancelled.status,
+                          (update_mod.DL_CANCELLED, update_mod.DL_OK))
+
+            # 404
+            mode["v"] = "404"
+            missing = update_mod.download_asset(
+                update_mod.Asset("y.exe", 0, url, ""), tmp)
+            self.assertEqual(missing.status, update_mod.DL_HTTP)
+        finally:
+            urlreq.install_opener(None)
+            srv.shutdown()
+            shutil.rmtree(tmp, ignore_errors=True)
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_download_async_calls_back(self):
+        import threading
+        got = []
+        done = threading.Event()
+        tmp = tempfile.mkdtemp(prefix="binfloater_dla_")
+
+        def cb(result):
+            got.append(result)
+            done.set()
+
+        try:
+            th = update_mod.download_async(
+                update_mod.Asset("z.exe", 0, "http://127.0.0.1:1/x", ""),
+                tmp, cb)
+            self.assertIsInstance(th, threading.Thread)
+            self.assertTrue(th.daemon)
+            self.assertTrue(done.wait(30))
+            self.assertFalse(got[0].ok)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_download_guards(self):
+        """没地址、没附件、目录建不了时的行为。"""
+        tmp = tempfile.mkdtemp(prefix="binfloater_dlg_")
+        try:
+            self.assertEqual(
+                update_mod.download_asset(None, tmp).status,
+                update_mod.DL_HTTP)
+            self.assertEqual(
+                update_mod.download_asset(
+                    update_mod.Asset("a.exe", 1, ""), tmp).status,
+                update_mod.DL_HTTP)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_download_wiring(self):
+        """静态检查应用内下载的几条硬规则还在。"""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        g = open(os.path.join(root, "gui.py"), encoding="utf-8").read()
+        self.assertIn("update_mod.download_async(", g)
+        self.assertIn("def _start_download", g)
+        self.assertIn("def _on_download_result", g)
+        self.assertIn("def _on_download_progress", g)
+        self.assertIn("def _launch_installer", g)
+        self.assertIn("def download_dir", g)
+        self.assertIn("BINF_DOWNLOAD_DIR", g)
+        # 下载线程不能碰 tkinter：进度和结果都走队列
+        self.assertIn("self._update_progress_queue.put_nowait", g)
+        self.assertIn("self._update_dl_queue.put_nowait", g)
+        # 启动安装程序要脱离本进程，否则父进程退出会把安装向导带走
+        self.assertIn("DETACHED_PROCESS", g)
+        # 没有安装包时必须退回浏览器，不能把 zip 当 exe 跑
+        self.assertIn("这个版本没有安装包", g)
+        u = open(os.path.join(root, "update.py"), encoding="utf-8").read()
+        # 先写 .part 再原子改名，断了不会留下看着像安装包的碎文件
+        self.assertIn('part = final + ".part"', u)
+        self.assertIn("os.replace(part, final)", u)
+        self.assertIn("hashlib.sha256()", u)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

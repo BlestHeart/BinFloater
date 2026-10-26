@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """冒烟测试：真的把 GUI 建起来，检查控件和钩子是否就绪，然后退出。"""
 import os
+import queue
 import sys
 import tempfile
 import time
@@ -21,6 +22,8 @@ import gui
 import hotkey as hotkey_mod
 import keys
 import trigger
+import update as update_mod
+import version as version_mod
 
 if clipwin.IS_WINDOWS:
     try:
@@ -548,7 +551,7 @@ app._on_update_result(update_mod.UpdateInfo(
     body="# 更新\n- 修了 A", html_url="https://example.com/dl"))
 check("查到新版时文字带新版本号", "v9.9.9" in app._update_lbl.cget("text"),
       app._update_lbl.cget("text"))
-check("查到新版时按钮变去下载", app._update_btn.cget("text") == "去下载",
+check("查到新版时按钮变下载并安装", app._update_btn.cget("text") == "下载并安装",
       app._update_btn.cget("text"))
 check("查到新版时文字用亮色", app._update_lbl.cget("fg") == gui.TEAL,
       app._update_lbl.cget("fg"))
@@ -588,6 +591,159 @@ app._on_update_result(update_mod.UpdateInfo(
     update_mod.NETWORK, "连不上 GitHub：timed out"))
 check("网络失败带原因", "timed out" in app.status.cget("text"),
       app.status.cget("text"))
+
+# 点「下载并安装」不应该重新发检查请求，而是开始下载安装包。
+# 这里用本地假服务提供一个真 exe（内容随便），把下载链路走完。
+import hashlib as _hashlib
+import http.server as _httpserver
+import threading as _threading
+
+_PAYLOAD = b"MZ" + b"\x00" * 200000     # 假装是 200KB 的安装包
+_DIGEST = _hashlib.sha256(_PAYLOAD).hexdigest()
+
+
+class _AssetHandler(_httpserver.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(_PAYLOAD)))
+        self.end_headers()
+        self.wfile.write(_PAYLOAD)
+
+    def log_message(self, *a):
+        pass
+
+
+_srv = _httpserver.HTTPServer(("127.0.0.1", 0), _AssetHandler)
+_sport = _srv.server_address[1]
+_threading.Thread(target=_srv.serve_forever, daemon=True).start()
+_DLDIR = tempfile.mkdtemp(prefix="binfloater_upd_")
+_old_dl = os.environ.get("BINF_DOWNLOAD_DIR")
+os.environ["BINF_DOWNLOAD_DIR"] = _DLDIR
+# 本地回环不能走代理，否则请求会被导到代理上
+import urllib.request as _urlreq
+_urlreq.install_opener(_urlreq.build_opener(_urlreq.ProxyHandler({})))
+
+try:
+    app._on_update_result(update_mod.UpdateInfo(
+        update_mod.OK, latest="v9.9.9", current=version_mod.VERSION,
+        body="- 修了 A", html_url="https://example.com/dl",
+        assets=[update_mod.Asset(
+            "BinFloater-Setup-9.9.9.exe", len(_PAYLOAD),
+            "http://127.0.0.1:%d/setup.exe" % _sport,
+            "sha256:" + _DIGEST)]))
+    check("有安装包时按钮是下载并安装",
+          app._update_btn.cget("text") == "下载并安装", app._update_btn.cget("text"))
+
+    app._check_update(manual=True)      # 等同于点按钮
+    check("点了之后进入下载中", app._update_downloading is True)
+    check("下载中按钮变成取消", app._update_btn.cget("text") == "取消",
+          app._update_btn.cget("text"))
+
+    # 等下载结果。这里刻意不调 root.update()：那会把主循环跑起来，
+    # 而 _drain_updates 是靠 after(200) 自动跑的，它会先把队列里的结果
+    # 吃掉并调 _on_download_result——测试自己就永远取不到了（早期就是
+    # 在这里挂死的）。只 poll 队列，拿到后自己调一次处理函数，行为确定。
+    _dl_result = None
+    _t0 = time.time()
+    while time.time() - _t0 < 30:
+        try:
+            _dl_result = app._update_dl_queue.get_nowait()
+            break
+        except queue.Empty:
+            time.sleep(0.02)
+    check("下载有结果返回", _dl_result is not None)
+    check("下载成功", _dl_result is not None and _dl_result.ok,
+          _dl_result.status if _dl_result else "none")
+    if _dl_result is not None and _dl_result.ok:
+        check("安装包落盘了", os.path.isfile(_dl_result.path), _dl_result.path)
+        check("安装包内容对",
+              open(_dl_result.path, "rb").read() == _PAYLOAD)
+        check("没有留下 .part",
+              not os.path.exists(_dl_result.path + ".part"))
+        check("下到了指定目录",
+              os.path.dirname(_dl_result.path) == os.path.abspath(_DLDIR),
+              os.path.dirname(_dl_result.path))
+
+    # 主线程处理结果 -> 按钮变「安装」
+    app._on_download_result(_dl_result)
+    check("下载完按钮变安装", app._update_btn.cget("text") == "安装",
+          app._update_btn.cget("text"))
+    check("版本行说安装包就绪", "安装包已就绪" in app._update_lbl.cget("text"),
+          app._update_lbl.cget("text"))
+    check("状态栏提示点安装", "安装" in app.status.cget("text"),
+          app.status.cget("text"))
+
+    # 校验和不匹配时不落盘、且状态是 DL_BAD_HASH
+    # 变量名别用 bad：脚本顶层 `bad` 是失败用例的列表，覆盖了会让后面的
+    # check() 去 .append 一个 DownloadResult，报 AttributeError。
+    # 断言不能写「同名文件不存在」：前面已经成功下过一份同名安装包，
+    # 正确语义是「失败不能把已存在的那份弄坏」。所以先记原文件指纹。
+    app._update_ready_path = ""
+    app._update_downloading = False
+    _target = os.path.join(_DLDIR, "BinFloater-Setup-9.9.9.exe")
+    _before = None
+    if os.path.isfile(_target):
+        _before = open(_target, "rb").read()
+    _bad_hash = update_mod.download_asset(
+        update_mod.Asset("BinFloater-Setup-9.9.9.exe", len(_PAYLOAD),
+                         "http://127.0.0.1:%d/setup.exe" % _sport,
+                         "sha256:" + "0" * 64),
+        _DLDIR)
+    check("校验和不匹配被挡住",
+          _bad_hash.status == update_mod.DL_BAD_HASH, _bad_hash.status)
+    check("校验失败不留下 .part",
+          not os.path.exists(_target + ".part"))
+    check("校验失败不弄坏已下的安装包",
+          _before is None or open(_target, "rb").read() == _before)
+
+    # 取消：should_stop 一开始就是 True
+    _cancelled = update_mod.download_asset(
+        update_mod.Asset("BinFloater-Setup-9.9.9.exe", len(_PAYLOAD),
+                         "http://127.0.0.1:%d/setup.exe" % _sport, ""),
+        _DLDIR, should_stop=lambda: True)
+    check("能取消下载",
+          _cancelled.status in (update_mod.DL_CANCELLED, update_mod.DL_OK),
+          _cancelled.status)
+
+    # 只有 zip 的旧版 Release：不自动下，退回浏览器
+    app._update_result = update_mod.UpdateInfo(
+        update_mod.OK, latest="v9.9.9", current=version_mod.VERSION,
+        html_url="https://example.com/dl",
+        assets=[update_mod.Asset("BinFloater.zip", 1000, "http://x/z")])
+    app._update_downloading = False
+    app._update_ready_path = ""
+    _opened2 = []
+    _orig2 = os.startfile
+    os.startfile = lambda p: _opened2.append(p)
+    try:
+        app._start_download(app._update_result)
+        check("没有安装包时退回浏览器",
+              _opened2 == ["https://example.com/dl"], _opened2)
+        check("没有安装包时不进入下载中", app._update_downloading is False)
+    finally:
+        os.startfile = _orig2
+
+    # _launch_installer 用假的 path 探一下：文件不存在时要报错，不能抛异常
+    app._update_ready_path = os.path.join(_DLDIR, "不存在的.exe")
+    try:
+        app._launch_installer(app._update_ready_path)
+        check("启动不存在的安装包不抛异常", True)
+        check("启动不存在的安装包有提示",
+              "不见了" in app.status.cget("text"), app.status.cget("text"))
+    except Exception as _exc:
+        check("启动不存在的安装包不抛异常", False, repr(_exc))
+finally:
+    _srv.shutdown()
+    if _old_dl is None:
+        os.environ.pop("BINF_DOWNLOAD_DIR", None)
+    else:
+        os.environ["BINF_DOWNLOAD_DIR"] = _old_dl
+    try:
+        import shutil as _sh2
+        _sh2.rmtree(_DLDIR, ignore_errors=True)
+    except Exception:
+        pass
 
 # 自动检查开关能关，且写进配置
 app._toggle_auto_update()

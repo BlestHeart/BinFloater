@@ -31,6 +31,13 @@ desktop.ini
 *.swp
 *~
 
+# ─── 提交/发版时临时写的文本 ──────────────────────────────
+# git commit -F 和 gh release create --notes-file 需要落一个文件，
+# 用完就删；忘了删时别让它进仓库。
+.cm.txt
+.commitmsg.txt
+.relnotes.md
+
 # ─── 运行时生成的配置 ───────────────────────────────────────
 # 真实配置在 %APPDATA%\BinFloater\，项目目录里不该有
 config.json

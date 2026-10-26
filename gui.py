@@ -9,6 +9,7 @@ import json
 import os
 import queue
 import shutil
+import subprocess
 import sys
 import time
 import tkinter as tk
@@ -446,6 +447,16 @@ class BinFloater:
         # 上次自动检查的日期（YYYY-MM-DD）。一天只查一次，不然每启动一次
         # 都往 api.github.com 发请求，匿名限流 60 次/小时很快就用完。
         self._update_last_day = str(self.cfg.get("update_last_day", ""))
+        # 应用内下载安装包。两个队列分开：进度会来几十上百次，结果只来一次，
+        # 混在一起每次取都要判类型，没必要。
+        self._update_progress_queue = queue.Queue()
+        self._update_dl_queue = queue.Queue()
+        self._update_downloading = False
+        self._update_cancel = False
+        self._update_got = 0
+        self._update_total = 0
+        # 下载完成后的安装包路径。有值就意味着按钮该显示「安装」。
+        self._update_ready_path = ""
         self._watcher = None
         # 用户最近用的那个窗口。面板按钮触发时要先把焦点还回去。
         self._last_foreign_hwnd = 0
@@ -1246,10 +1257,17 @@ class BinFloater:
     def _version_text(self):
         """版本那一行显示什么。
 
-        四种情况各说一句：刚启动/检查中、查到新版、已是最新、查失败。
+        情况按优先级排：下载中 > 下载好待安装 > 检查中 > 查到新版 > 已最新 > 失败。
         失败时把原因写出来——「检查更新失败」这种话等于没说。
         """
         cur = "v%s" % version.VERSION
+        if self._update_downloading:
+            if self._update_total > 0:
+                pct = int(self._update_got * 100 / self._update_total)
+                return "%s · 下载中 %d%%" % (cur, pct)
+            return "%s · 下载中…" % cur
+        if self._update_ready_path:
+            return "%s · 安装包已就绪" % cur
         if self._update_checking:
             return "%s · 正在检查…" % cur
         res = self._update_result
@@ -1271,26 +1289,37 @@ class BinFloater:
                 fg=TEAL if (self._update_result is not None
                             and self._update_result.has_update) else MUTED,
             )
-            if self._update_checking:
+            if self._update_downloading:
+                self._update_btn.configure(text="取消", fg=WARN, cursor="hand2")
+            elif self._update_ready_path:
+                self._update_btn.configure(text="安装", fg=OK, cursor="hand2")
+            elif self._update_checking:
                 self._update_btn.configure(text="检查中…", fg=MUTED, cursor="arrow")
             elif self._update_result is not None and self._update_result.has_update:
-                self._update_btn.configure(text="去下载", fg=TEAL, cursor="hand2")
+                self._update_btn.configure(text="下载并安装", fg=TEAL, cursor="hand2")
             else:
                 self._update_btn.configure(text="检查更新", fg=MUTED, cursor="hand2")
         except tk.TclError:
             pass
 
-    # ---------------- 检查更新 ----------------
+    # ---------------- 检查更新 / 应用内下载 ----------------
 
     def _check_update(self, manual=False):
         """查一次最新版本。manual=True 表示是用户点的，失败要明说。
 
-        已经查到新版时，再点一下就是「去下载」——不重复发请求，直接开下载页。
-        这个分支必须先判，否则用户看到按钮写着「去下载」，点下去却变成重新检查。
+        已经查到新版时，再点一下就是「下载并安装」——不重复发请求。
+        这个分支必须先判，否则用户看到按钮写着「下载并安装」，点下去
+        却变成重新检查。
         """
         res = self._update_result
+        # 下载中点按钮 = 取消。这个分支必须排在「已查到新版」前面，
+        # 否则点下去会又去开始一次下载。
+        if self._update_downloading:
+            self._update_cancel = True
+            self._set_status("正在取消下载…", WARN, 4000)
+            return
         if not self._update_checking and res is not None and res.has_update:
-            self._open_release_page(res.html_url)
+            self._start_download(res)
             return
         if self._update_checking:
             return
@@ -1316,8 +1345,72 @@ class BinFloater:
             if manual:
                 self._set_status("检查更新时出错：%r" % (exc,), ERR, 6000)
 
+    def download_dir(self):
+        """安装包下到哪儿。
+
+        优先 `BINF_DOWNLOAD_DIR` 环境变量（测试要用），否则放配置目录下的
+        updates 子目录。为什么不放 %TEMP%：用户可能想自己再留一份，而且
+        安全软件对系统临时目录里出现 exe 更敏感。
+        """
+        folder = os.environ.get("BINF_DOWNLOAD_DIR")
+        if not folder:
+            folder = os.path.join(config_dir(), "updates")
+        return folder
+
+    def _start_download(self, res):
+        """点「下载并安装」后的动作。
+
+        三条路：
+          1. 已经下过了（_update_ready_path 有值）→ 直接启动安装
+          2. Release 里有 Setup.exe → 应用内下载，完了自己启动安装
+          3. 只有 zip（旧版 Release）→ 退回开浏览器，别把 zip 当安装包跑
+
+        下载在后台线程，进度和结果都入队，主线程取。
+        """
+        if self._update_ready_path:
+            self._launch_installer(self._update_ready_path)
+            return
+
+        asset = res.installer if res is not None else None
+        if asset is None:
+            # 没有安装包就开浏览器。不自动下 zip：解压到哪儿、要不要覆盖
+            # 正在跑的程序目录，这些得用户自己决定。
+            self._set_status("这个版本没有安装包，用浏览器打开下载页", WARN, 6000)
+            self._open_release_page(res.html_url if res else None)
+            return
+
+        self._update_downloading = True
+        self._update_cancel = False
+        self._update_got = 0
+        self._update_total = asset.size
+        self._paint_update_row()
+        self._set_status("正在下载 %s…" % asset.name, MUTED, 0)
+
+        def on_progress(written, total):
+            # 后台线程！只记数字，不碰 tkinter
+            try:
+                self._update_progress_queue.put_nowait((written, total))
+            except Exception:
+                pass
+
+        def on_done(result):
+            try:
+                self._update_dl_queue.put_nowait(result)
+            except Exception:
+                pass
+
+        try:
+            update_mod.download_async(
+                asset, self.download_dir(), on_done,
+                progress=on_progress,
+                should_stop=lambda: self._update_cancel)
+        except Exception as exc:
+            self._update_downloading = False
+            self._paint_update_row()
+            self._set_status("下载启动失败：%r" % (exc,), ERR, 8000)
+
     def _drain_updates(self):
-        """主线程取后台线程的检查结果。"""
+        """主线程取后台线程的检查/下载结果与进度。"""
         if not self._alive:
             return
         try:
@@ -1328,10 +1421,92 @@ class BinFloater:
             pass
         except Exception:
             pass
+
+        try:
+            while True:
+                written, total = self._update_progress_queue.get_nowait()
+                self._on_download_progress(written, total)
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
+
+        try:
+            while True:
+                result = self._update_dl_queue.get_nowait()
+                self._on_download_result(result)
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
+
         try:
             self.root.after(200, self._drain_updates)
         except Exception:
             pass
+
+    def _on_download_progress(self, written, total):
+        """下载中：更新进度显示。"""
+        self._update_got = written
+        self._update_total = total
+        if total > 0:
+            pct = int(written * 100 / total)
+            self._set_status(
+                "正在下载安装包 %d%%（%.1f / %.1f MB）" % (
+                    pct, written / 1048576.0, total / 1048576.0), MUTED, 0)
+        else:
+            self._set_status("正在下载安装包 %.1f MB…" % (written / 1048576.0), MUTED, 0)
+
+    def _on_download_result(self, result):
+        """下载完了：成功就等着用户点「安装」，失败把原因原样说出来。"""
+        self._update_downloading = False
+        self._update_cancel = False
+        if result.ok:
+            self._update_ready_path = result.path
+            self._paint_update_row()
+            self._set_status(
+                "安装包已下载好（%.1f MB），点「安装」开始装" % (
+                    result.bytes / 1048576.0), OK, 0)
+            self._notify_tray(
+                "安装包已下载好",
+                "点「安装」开始装，装的时候会先关掉当前窗口。")
+        else:
+            self._paint_update_row()
+            self._set_status("下载失败：%s" % (result.message or "未知原因"),
+                             ERR, 8000)
+
+    def _launch_installer(self, path):
+        """启动安装程序，然后退出自己。
+
+        为什么必须退出：安装包要覆盖 BinFloater.exe 和 _internal 里的文件，
+        我们正占用着它们，不退出就会出现「文件正在使用」的报错。
+        这就是「不自己替换自己」——真正动手的是 Inno Setup，不是我们。
+
+        Inno 的 PrepareToInstall 里本来就会 taskkill 一次，但我们自己先退
+        更优雅：能正常存配置、卸托盘、撤钩子。
+        """
+        if not path or not os.path.isfile(path):
+            self._set_status("安装包不见了：%s" % path, ERR, 8000)
+            self._update_ready_path = ""
+            self._paint_update_row()
+            return
+        try:
+            # 用 DETACHED_PROCESS 让安装程序脱离本进程，否则父进程退出时
+            # 安装向导可能被一起带走（UAC 提权对话框弹不出来）。
+            subprocess.Popen(
+                [path],
+                creationflags=getattr(subprocess, "DETACHED_PROCESS", 0x8),
+                close_fds=True,
+            )
+        except Exception as exc:
+            self._set_status("启动安装程序失败：%r" % (exc,), ERR, 10000)
+            return
+        self._set_status("正在退出，准备安装…", TEAL, 2000)
+        # 给窗口一点时间把状态栏画出来，然后正常退出流程走一遍
+        try:
+            self.root.after(400, self._quit)
+        except Exception:
+            self._quit()
 
     def _on_update_result(self, result):
         """拿到结果：刷界面、必要时弹托盘气泡。"""
@@ -2133,6 +2308,8 @@ class BinFloater:
         self._release_watcher()
         self._stop_tray()
         self._stop_waker()
+        # 下到一半的 .part 文件别留着——下次启动也不会接着下，只会白占硬盘
+        self._update_cancel = True
         try:
             self.cfg["x"] = self.root.winfo_x()
             self.cfg["y"] = self.root.winfo_y()
