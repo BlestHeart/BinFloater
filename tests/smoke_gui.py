@@ -7,6 +7,12 @@ import tempfile
 import time
 import tkinter as tk
 
+# 玩游戏时别让测试弹置顶窗口盖住画面：设 BINF_NO_FOCUS=1 直接跳过。
+# 这个测试会真建一个置顶窗口。
+if os.environ.get("BINF_NO_FOCUS"):
+    print("BINF_NO_FOCUS=1：跳过（这个测试会弹置顶窗口）")
+    sys.exit(0)
+
 # 必须在 import gui 之前把配置目录指到临时目录：gui.config_path() 会读它。
 # 否则这个测试会写真实配置——曾经把 tray_hint_shown 置成 true，
 # 结果用户永远看不到「已收进托盘」那条气泡通知。

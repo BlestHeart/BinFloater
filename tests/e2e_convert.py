@@ -12,6 +12,12 @@ import ctypes
 import os
 import sys
 import time
+
+# 玩游戏/开会时别让测试抢前台焦点：设 BINF_NO_FOCUS=1 直接跳过。
+# 这些测试要 SendInput + SetForegroundWindow，会把焦点从你正在用的窗口抢走。
+if os.environ.get("BINF_NO_FOCUS"):
+    print("BINF_NO_FOCUS=1：跳过（这个测试会抢前台焦点）")
+    sys.exit(0)
 from ctypes import wintypes
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

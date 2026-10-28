@@ -6,10 +6,17 @@ import sys
 import time
 import tkinter as tk
 
+# 玩游戏时别让测试弹置顶窗口盖住画面：设 BINF_NO_FOCUS=1 直接跳过。
+# 这个测试会真建一个置顶窗口。
+if os.environ.get("BINF_NO_FOCUS"):
+    print("BINF_NO_FOCUS=1：跳过（这个测试会弹置顶窗口）")
+    sys.exit(0)
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import clipwin
 import gui
+from gui import MUTED
 
 if clipwin.IS_WINDOWS:
     try:
@@ -24,6 +31,12 @@ root = tk.Tk()
 app = gui.BinFloater(root)
 root.update()
 root.update_idletasks()
+# 截图前把剪切板监听按下暂停、状态栏固定成一句中性文字。
+# 不这么做的话，状态栏会显示「剪切板是普通文字：<前 22 字>」，
+# 而这张图是要进仓库、要公开的——等于把剪切板内容晒出去。
+app._clip_paused = True
+app._paint_pause_btn()
+app._set_status("已就绪", MUTED, 0)
 root.geometry("+120+80")
 root.update()
 time.sleep(0.6)

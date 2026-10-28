@@ -5,6 +5,7 @@
 """
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -1427,6 +1428,78 @@ class TestUpdate(unittest.TestCase):
         self.assertIn('part = final + ".part"', u)
         self.assertIn("os.replace(part, final)", u)
         self.assertIn("hashlib.sha256()", u)
+
+
+class TestPerf(unittest.TestCase):
+    """性能优化后的等价性护栏。
+
+    这一轮给 core.py 加了几条「便宜的快速通道」：前缀早退、字节查表、
+    整串转整数、_clean_bits 跳过正则。它们只有在结果与慢路径完全一致时
+    才是优化，所以这里用老实现逐条对照，防止以后有人顺手改坏。
+    """
+
+    def _old_clean_bits(self, text):
+        t = text.strip()
+        t = re.sub(r"[\s,;:_\-|/.\\]+", "", t)
+        t = re.sub(r"(?i)0b", "", t)
+        return t
+
+    def test_clean_bits_matches_old_implementation(self):
+        cases = ["", "  ", "01000001", "0b01000001", "010_0b01", "0 1 0", "0,1;0",
+                 "0B11", "a0b1", "01010101 01010111", chr(0x2003) + "010",
+                 chr(9) + "010", "0100b01", "0b0b01", "0b", "b", "0b1_0b0"]
+        for c in cases:
+            self.assertEqual(core._clean_bits(c), self._old_clean_bits(c), repr(c))
+
+    def test_prefix_ok_allows_all_whitespace(self):
+        # re 的空白类覆盖全部 Unicode 空白，前缀检查必须跟它同一套语义，
+        # 否则 U+2003 这种冷门空白会让「提前判否」与全长判定不一致。
+        for ch in (" ", chr(9), chr(10), chr(0x3000), chr(0x2003), chr(0xA0)):
+            self.assertTrue(core._prefix_ok(ch + "010", core._BIN_ALLOWED), repr(ch))
+        self.assertFalse(core._prefix_ok("中010", core._BIN_ALLOWED))
+        self.assertFalse(core._prefix_ok("zz010", core._BIN_ALLOWED))
+
+    def test_prefix_check_does_not_change_detection(self):
+        # 前缀早退只是必要条件：命中与不命中都必须和「扫全长」的结论一致。
+        samples = ["01010101", "0b0101 0101", "41 42 43", "SGVsbG8=", ".... . .-..",
+                   "HelloWorld", "password123", "DeadBeef", "2024-01-01",
+                   "中文一段话", "  " + "0" * 20, chr(0x3000) + "0101"]
+        for s in samples:
+            expect_bin = core.looks_like_binary(s)
+            # 关掉前缀检查再跑一遍，结果必须相同
+            old = core._prefix_ok
+            core._prefix_ok = lambda text, allowed: True
+            try:
+                got_bin = core.looks_like_binary(s)
+            finally:
+                core._prefix_ok = old
+            self.assertEqual(expect_bin, got_bin, repr(s))
+
+    def test_bytes_to_binary_group8_matches_generic(self):
+        # group=8 走的是「按字节查表直接 join」的快路径，结果必须与通用
+        # 切片路径逐字相同。
+        for text in ["", "A", "hi", "测试", "A" * 33, "line1 line2"]:
+            data = text.encode("utf-8")
+            bits = "".join(format(b, "08b") for b in data)
+            for g in (1, 4, 8, 13):
+                expect = " ".join(bits[i:i + g] for i in range(0, len(bits), g))
+                self.assertEqual(core.bytes_to_binary(data, g, " "), expect, (text, g))
+
+    def test_bits_to_bytes_matches_per_chunk(self):
+        # 整串 int(bits,2).to_bytes() 必须与「每 8 位一次 int()」完全一致，
+        # 包括前导 0 和末尾不足 8 位的补齐。
+        for bits in ["", "0", "1", "01000001", "00000000", "0" * 8, "1" * 8,
+                     "01000001" + "0" * 7, "1" * 200, "0" * 99 + "1"]:
+            pad = (-len(bits)) % 8
+            padded = bits + "0" * pad
+            expect = bytes(int(padded[i:i + 8], 2) for i in range(0, len(padded), 8))
+            self.assertEqual(core.bits_to_bytes(bits), expect, repr(bits[:20]))
+
+    def test_binary_roundtrip_still_exact(self):
+        for text in ["a", "hello world", "中文测试", "A" * 5000, "line1 line2"]:
+            enc = core.text_to_binary(text, 8, " ")
+            dec, _ = core.binary_to_text(enc)
+            self.assertEqual(dec, text)
 
 
 if __name__ == "__main__":

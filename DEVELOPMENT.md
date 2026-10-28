@@ -76,7 +76,7 @@ bash build_installer.sh --no-build   # 只重新生成安装包，用现有 dist
 ## 测试
 
 ```bash
-python tests/test_all.py       # 143 项：编解码四种格式 + 格式识别 + 触发逻辑 + 快捷键解析 + 版本号 + 检查更新 + 应用内下载 + 源码约定
+python tests/test_all.py       # 149 项：编解码四种格式 + 格式识别 + 性能优化等价性 + 触发逻辑 + 快捷键解析 + 版本号 + 检查更新 + 应用内下载 + 源码约定
 python tests/test_config.py    #  64 项：配置原子写盘、坏文件备份、类型校验、错误日志、配置目录选择、安装脚本
 python tests/smoke_gui.py      # 198 项：真建窗口，控件、钩子、托盘、历史、滑块、录制回显、长文本保护、检查更新、应用内下载、自动检查开关可见性
 python tests/e2e_convert.py    #  23 项：真 Win32 窗口，真按键、真粘贴、选区边界
@@ -85,8 +85,44 @@ python tests/e2e_roundtrip.py  #  18 项：文字 → 二进制 → 文字 往�
 python tests/install_check.py  #  12 项：真装一遍、启动、优雅退出、卸载，核对装到非 C 盘
 ```
 
-合计 455 项（含安装实测 12 项）。`e2e_*.py` 会真的动键盘和剪切板，
+合计 461 项（含安装实测 12 项）。`e2e_*.py` 会真的动键盘和剪切板，
 `install_check.py` 会真的往你的 D 盘装一份再卸掉，跑之前先把正在编辑的东西存一下。
+
+### 不想让测试抢前台焦点
+
+玩游戏、开会的时候跑测试很烦——`e2e_*` 会 `SendInput` 敲键盘抢前台，`smoke_gui` / `shot` 会弹置顶窗口。设一个环境变量就全跳过：
+
+```bash
+BINF_NO_FOCUS=1 python tests/test_all.py    # 这条本来就不碰焦点，照常跑
+BINF_NO_FOCUS=1 python tests/smoke_gui.py   # 直接打印「已跳过」退出
+```
+
+`test_all.py` 和 `test_config.py` 全程不开窗口（GUI 只做静态检查），不受影响。
+
+### 性能：为什么 core.py 里有几条「快速通道」
+
+`detect_format` 每次剪切板一变就要跑，而且要对四种格式各判一次。原来的写法是「先全量扫一遍再说」，几万字的文本要几十毫秒。现在加了几条**结果完全等价**的提前退出：
+
+| 位置 | 快速通道 | 触发条件 |
+|---|---|---|
+| `_prefix_ok` | 只看开头 400 字符 | 中英文一上来就有非该格式字符，直接否掉，省掉后面的全长正则 |
+| `_clean_bits` | 已是纯 0/1 就直接返回 | 没有分隔符要清 |
+| `_clean_bits` | 没有 `b`/`B` 就不跑 `(?i)0b` | 那条正则没法用前缀加速，白扫一遍很浪费 |
+| `bytes_to_binary` | `group == 8` 时按字节查表直接 join | 一个字节正好 8 位，切点必然落在字节边界 |
+| `bits_to_bytes` | `int(bits, 2).to_bytes()` 整串转 | 90 万位要切 11 万次，逐段 `int()` 太慢 |
+
+实测（同一台机器）：
+
+| 场景 | 优化前 | 优化后 |
+|---|---|---|
+| `detect_format` 1 千字 | 0.54 ms | 0.01 ms |
+| `detect_format` 1 万字 | 5.55 ms | 0.01 ms |
+| `detect_format` 5 万字 | 26.35 ms | 0.04 ms |
+| `looks_like_binary` 5 万字 | 4.96 ms | 0.00 ms |
+| `encode_as` 2 万字 | 14.13 ms | 5.12 ms |
+| `binary_to_text` 90 万位 | 105 ms | 67 ms |
+
+**这些优化只有在结果完全一致时才成立**，所以 `tests/test_all.py` 里的 `TestPerf` 用老实现逐条对照：`_clean_bits` 16 个边界串、`_prefix_ok` 的空白语义、`bytes_to_binary` 的四种 group、`bits_to_bytes` 的前导 0 与末尾补齐。改这些函数前先看那组测试。
 
 `smoke_gui.py` 和 `test_config.py` 都会把 `BINF_CONFIG_DIR` / `APPDATA` 指到临时目录
 再建窗口，否则测试会把 `tray_hint_shown`、`space_count` 之类的状态写进你真实的

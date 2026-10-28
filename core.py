@@ -13,6 +13,8 @@ from typing import Optional, Tuple
 # 可识别的二进制文本形态：
 #   01001000 01101001 / 0100100001101001 / 0b01001000_0b01101001 / 0100-1000 ...
 _BIN_CHARS = set("01")
+# 取样用：0/1、0b 前缀里的 b、_clean_bits 会去掉的分隔符，外加反斜杠
+_BIN_ALLOWED = _BIN_CHARS | set("bB,;:_-|/.") | {chr(92)}
 
 # 「像二进制」的长度上限，纯粹是防超大文本卡界面用的，不是判定规则。
 # 早先定的是 20000，但文字转二进制后长度涨约 25 倍（UTF-8 每字节 8 位 + 分隔空格），
@@ -22,14 +24,46 @@ _BIN_CHARS = set("01")
 MAX_BINARY_CHARS = 1000000
 
 
+# 判断格式时只看开头这么多字符就够排除掉绝大多数内容。
+# 四种编码的字符集互不相同，随便一段中文/英文在头几个字符上就会露馅，
+# 没必要为了「不是它」这个结论把整段 90 万字符扫一遍。
+_PREFIX_SAMPLE = 400
+
+
+def _prefix_ok(text: str, allowed) -> bool:
+    """开头一小段里出现了不该有的字符，整段就一定不是这个格式。
+
+    只是必要条件，所以「提前判否」和「扫完全长再判否」结果完全一致。
+    空白一律放行：各格式本来就用 re 的空白类去分隔符，而它覆盖全部
+    Unicode 空白；这里用 isspace() 保持同一套语义，否则遇到 U+2003
+    这类冷门空白会和旧行为不一致。
+    """
+    for ch in text[:_PREFIX_SAMPLE]:
+        if ch not in allowed and not ch.isspace():
+            return False
+    return True
+
+
 def _clean_bits(text: str) -> str:
     """从一段“疑似二进制”的字符串里提取纯 0/1 位串。
 
     先去掉分隔符，再去掉 0b 前缀（顺序反了 '010_0b01' 这种会残留 b）。
+
+    两道正则都是全长扫描，几十万字符的串上各要几十毫秒，所以都加了
+    便宜的快速通道：已经是纯 0/1 就直接返回，没有 b/B 字样就不跑第二条。
+    判定条件是严格的必要条件，走快速通道与走正则结果一致。
     """
     t = text.strip()
+    if not t:
+        return t
+    # 已经是纯 0/1 就没有分隔符要清，省掉一次全长正则扫描。
+    if not (set(t) - _BIN_CHARS):
+        return t
     t = re.sub(r"[\s,;:_\-|/.\\]+", "", t)
-    t = re.sub(r"(?i)0b", "", t)
+    # (?i)0b 这条正则没法用前缀加速，几十万字符的串上白扫一遍很浪费；
+    # 先做一次子串检查，没有 b/B 就直接跳过。
+    if "b" in t or "B" in t:
+        t = re.sub(r"(?i)0b", "", t)
     return t
 
 
@@ -39,6 +73,10 @@ def looks_like_binary(text: str, min_len: int = 8) -> bool:
         return False
     raw = text.strip()
     if len(raw) > MAX_BINARY_CHARS:  # 防止超大文本卡界面
+        return False
+    # 先花 O(400) 看一眼开头：中英文一上来就有别的字符，直接否掉，
+    # 省掉下面两次全长的正则替换。
+    if not _prefix_ok(raw, _BIN_ALLOWED):
         return False
     bits = _clean_bits(raw)
     if len(bits) < min_len:
@@ -56,13 +94,21 @@ def bits_to_bytes(bits: str) -> bytes:
 
     补在右边（低位）而不是左边：不完整的那个字节是数据的高位部分，
     补 0 到低位才是它本来的值。
+
+    实现上用 int(bits, 2) 一次性转成一个大整数再 to_bytes，而不是每 8 位
+    调一次 int()。90 万位的串要切 11 万次，逐段转要 100 ms 上下；整串转
+    是 C 层的线性扫描，快一个数量级。base 2 是 2 的幂，不受 int() 对超长
+    十进制字面量的位数限制影响。
     """
     if not bits:
         return b""
     pad = (-len(bits)) % 8
     if pad:
         bits = bits + "0" * pad
-    return bytes(int(bits[i : i + 8], 2) for i in range(0, len(bits), 8))
+    n = len(bits) // 8
+    if n == 0:
+        return b""
+    return int(bits, 2).to_bytes(n, "big")
 
 
 def bytes_to_text(data: bytes) -> str:
@@ -150,12 +196,21 @@ def binary_to_hex(text: str) -> str:
     return " ".join(f"{b:02X}" for b in data)
 
 
+# 每字节 -> 8 位串的查表。原来是 f-string 逐个格式化，几 MB 的文件时
+# 明显偏慢；查表是纯下标访问，快一倍以上。
+_BYTE_BITS = [format(i, "08b") for i in range(256)]
+
+
 def bytes_to_binary(data: bytes, group: int = 8, sep: str = " ") -> str:
     """字节 -> 二进制位串。用于把任意文件（图片等）编成 0/1 文本。"""
     if not data:
         return ""
-    bits = "".join(f"{b:08b}" for b in data)
     group = max(1, int(group))
+    # group=8 是最常用的（一个字节正好 8 位），这时切点必然落在字节边界
+    # 上，直接按字节查表再 join，省掉拼出几十万字符的大串再切片。
+    if group == 8:
+        return sep.join([_BYTE_BITS[b] for b in data])
+    bits = "".join([_BYTE_BITS[b] for b in data])
     chunks = [bits[i : i + group] for i in range(0, len(bits), group)]
     return sep.join(chunks)
 
@@ -164,6 +219,7 @@ def bytes_to_binary(data: bytes, group: int = 8, sep: str = " ") -> str:
 # 十六进制
 # ---------------------------------------------------------------------------
 _HEX_CHARS = set("0123456789abcdefABCDEF")
+_HEX_ALLOWED = _HEX_CHARS | set("xX:,_-")
 
 
 def _decode_is_text(data: bytes) -> bool:
@@ -206,6 +262,8 @@ def looks_like_hex(text: str, min_len: int = 4) -> bool:
         return False
     raw = text.strip()
     if len(raw) > MAX_BINARY_CHARS:
+        return False
+    if not _prefix_ok(raw, _HEX_ALLOWED):
         return False
     has_prefix = bool(re.search(r"(?i)0x", raw))
     # 有没有分隔符很关键：「4869」和「48 69」都可能是十六进制，但「2024」
@@ -273,6 +331,7 @@ def hex_to_text(text: str) -> Tuple[Optional[str], str]:
 # Base64
 # ---------------------------------------------------------------------------
 _B64_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+_B64_ALLOWED = _B64_CHARS | {"-", "_"}
 
 
 def looks_like_base64(text: str, min_len: int = 4) -> bool:
@@ -291,6 +350,10 @@ def looks_like_base64(text: str, min_len: int = 4) -> bool:
     # 「0x48 0x69」这种明显是十六进制的写法别当 Base64：去掉分隔符后
     # 每个字符都在 Base64 字符集里，光看字符集分辨不出来。
     if re.search(r"(?i)0x", text):
+        return False
+    # 空白在 Base64 里允许（复制粘贴会带换行），所以取样时先按「可能含空白」
+    # 的字符集过一遍，比 re.sub 去掉全长空白便宜得多。
+    if not _prefix_ok(text.strip(), _B64_ALLOWED):
         return False
     raw = re.sub(r"\s+", "", text.strip())
     if len(raw) > MAX_BINARY_CHARS:
@@ -378,6 +441,8 @@ _MORSE_TABLE = {
 _MORSE_REVERSE = {v: k for k, v in _MORSE_TABLE.items()}
 # 摩斯码里点和划的常见替代写法：· 和 ・ 当点，— – ― 当划
 _MORSE_NORMALIZE = str.maketrans({"·": ".", "・": ".", "—": "-", "–": "-", "―": "-"})
+# 取样字符集要同时认归一化前的写法，否则「·」开头的串会被提前否掉
+_MORSE_ALLOWED = set(".-/?·・—–―")
 
 
 def looks_like_morse(text: str, min_len: int = 3) -> bool:
@@ -387,6 +452,8 @@ def looks_like_morse(text: str, min_len: int = 3) -> bool:
     不认的话带 ? 的摩斯串就识别不出来，往返会断。
     """
     if not text or not text.strip():
+        return False
+    if not _prefix_ok(text.strip(), _MORSE_ALLOWED):
         return False
     body = text.strip().translate(_MORSE_NORMALIZE)
     if len(body) > MAX_BINARY_CHARS:
