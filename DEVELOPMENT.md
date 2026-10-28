@@ -76,7 +76,7 @@ bash build_installer.sh --no-build   # 只重新生成安装包，用现有 dist
 ## 测试
 
 ```bash
-python tests/test_all.py       # 149 项：编解码四种格式 + 格式识别 + 性能优化等价性 + 触发逻辑 + 快捷键解析 + 版本号 + 检查更新 + 应用内下载 + 源码约定
+python tests/test_all.py       # 151 项：编解码四种格式 + 格式识别 + 性能优化等价性 + 触发逻辑 + 快捷键解析 + 版本号 + 检查更新 + 应用内下载 + 源码约定
 python tests/test_config.py    #  64 项：配置原子写盘、坏文件备份、类型校验、错误日志、配置目录选择、安装脚本
 python tests/smoke_gui.py      # 198 项：真建窗口，控件、钩子、托盘、历史、滑块、录制回显、长文本保护、检查更新、应用内下载、自动检查开关可见性
 python tests/e2e_convert.py    #  23 项：真 Win32 窗口，真按键、真粘贴、选区边界
@@ -85,7 +85,7 @@ python tests/e2e_roundtrip.py  #  18 项：文字 → 二进制 → 文字 往�
 python tests/install_check.py  #  12 项：真装一遍、启动、优雅退出、卸载，核对装到非 C 盘
 ```
 
-合计 461 项（含安装实测 12 项）。`e2e_*.py` 会真的动键盘和剪切板，
+合计 463 项（含安装实测 12 项）。`e2e_*.py` 会真的动键盘和剪切板，
 `install_check.py` 会真的往你的 D 盘装一份再卸掉，跑之前先把正在编辑的东西存一下。
 
 ### 不想让测试抢前台焦点

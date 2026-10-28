@@ -447,8 +447,15 @@ def fetch(current=None, url=None, timeout=None):
                 "仓库还没公开，读不到发布信息",
                 current=current,
             )
+        # 备用查询只在「真的去问 api.github.com」时启用。传了 url 说明是
+        # 测试用的本地假接口，不能顺手打到真网络上去。
+        alt = fetch_by_redirect(current, timeout) if url is None else None
+        if alt is not None and alt.status in (OK, UP_TO_DATE):
+            return alt
         if code == 403:
-            # 403 有两种：UA 被拒（我们带了，不会）、匿名限流 60 次/小时
+            # 403 基本只有一种：匿名限流 60 次/小时（UA 我们带了）。
+            # 这个额度按出口 IP 算，共用 NAT / 代理时很容易被别人用光，
+            # 所以上面先退回网页跳转那条路试一次，别让用户白等一个错误提示。
             return UpdateInfo(
                 FORBIDDEN,
                 "GitHub 拒绝了这次请求（可能是访问太频繁）",
@@ -471,6 +478,75 @@ def fetch(current=None, url=None, timeout=None):
         return UpdateInfo(BAD_JSON, "返回的内容不是 JSON：%s" % (exc,), current=current)
 
     return parse_release(payload, current)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """不让 urllib 自动跟随跳转，好让我们读到 Location 头。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def fetch_by_redirect(current=None, timeout=None, page=None):
+    """不碰 API，直接看 releases/latest 跳到哪个 tag。
+
+    为什么要这条备用路：api.github.com 的匿名额度是**按出口 IP** 算的，
+    每小时只有 60 次。很多人共用同一个出口（公司 NAT、运营商 CGNAT、
+    机场代理），别人用完了你这里就是 403，明明仓库是公开的却报「访问太频繁」。
+    而 github.com 的网页跳转不占这个额度，HEAD 一次就能拿到版本号。
+
+    代价是拿不到附件清单和更新说明，所以只能告诉用户「有新版本 vX」，
+    点「去下载」时开浏览器。够用：这条路只在 API 被限流时才走。
+    """
+    current = current or version.VERSION
+    if timeout is None:
+        timeout = READ_TIMEOUT_S
+
+    page = page or RELEASES_PAGE
+    req = urllib.request.Request(page, method="HEAD")
+    req.add_header("User-Agent", USER_AGENT)
+    opener = urllib.request.build_opener(_NoRedirect)
+
+    try:
+        opener.open(req, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        code = int(getattr(exc, "code", 0) or 0)
+        if code in (301, 302, 303, 307, 308):
+            loc = ""
+            try:
+                loc = exc.headers.get("Location") or ""
+            except Exception:
+                loc = ""
+            tag = loc.rstrip("/").rsplit("/", 1)[-1] if loc else ""
+            if tag and tag != "latest":
+                if version.is_newer(tag, current):
+                    return UpdateInfo(
+                        OK,
+                        "发现新版本 %s（GitHub 接口被限流，走的备用查询）" % tag,
+                        latest=tag,
+                        current=current,
+                        name=tag,
+                        html_url=loc,
+                    )
+                return UpdateInfo(
+                    UP_TO_DATE,
+                    "已经是最新版本（GitHub 接口被限流，走的备用查询）",
+                    latest=tag,
+                    current=current,
+                    html_url=loc,
+                )
+            return UpdateInfo(HTTP_ERROR, "跳转地址里没有版本号", current=current)
+        if code == 404:
+            return UpdateInfo(NOT_FOUND, "仓库还没公开，读不到发布信息", current=current)
+        return UpdateInfo(HTTP_ERROR, "服务器返回 HTTP %d" % code, current=current)
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        return UpdateInfo(NETWORK, "连不上 GitHub：%s" % (reason,), current=current)
+    except Exception as exc:
+        return UpdateInfo(NETWORK, "请求出错：%r" % (exc,), current=current)
+
+    # 没跳转说明 /releases/latest 直接就是终态，理论上不会走到这里
+    return UpdateInfo(HTTP_ERROR, "没有拿到跳转地址", current=current)
 
 
 def check_async(callback, current=None, url=None):

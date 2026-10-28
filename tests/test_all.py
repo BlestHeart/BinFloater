@@ -1207,6 +1207,106 @@ class TestUpdate(unittest.TestCase):
         self.assertTrue(done.wait(30))
         self.assertEqual(got[0].status, update_mod.NETWORK)
 
+    def test_fetch_by_redirect_against_local_server(self):
+        """API 被限流时的备用查询：读 releases/latest 的 Location 头。"""
+        import http.server
+        import threading
+        import urllib.request as urlreq
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            tag = "v9.9.9"
+
+            def do_HEAD(self):
+                if Handler.tag == "none":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(302)
+                self.send_header(
+                    "Location",
+                    "https://github.com/x/y/releases/tag/%s" % Handler.tag)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port = srv.server_address[1]
+        th = threading.Thread(target=srv.serve_forever)
+        th.daemon = True
+        th.start()
+        page = "http://127.0.0.1:%d/releases/latest" % port
+        saved = {}
+        for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+            saved[k] = os.environ.pop(k, None)
+        urlreq.install_opener(urlreq.build_opener(urlreq.ProxyHandler({})))
+        try:
+            # 比当前版本新 -> OK
+            Handler.tag = "v9.9.9"
+            r = update_mod.fetch_by_redirect(page=page)
+            self.assertEqual(r.status, update_mod.OK, r.message)
+            self.assertEqual(r.latest, "v9.9.9")
+            self.assertTrue(r.has_update)
+            self.assertIn("备用查询", r.message)
+
+            # 和当前一样 -> 已是最新
+            Handler.tag = version_mod.VERSION
+            r = update_mod.fetch_by_redirect(page=page)
+            self.assertEqual(r.status, update_mod.UP_TO_DATE)
+            self.assertFalse(r.has_update)
+
+            # 比当前旧 -> 也报已是最新
+            Handler.tag = "v0.0.1"
+            r = update_mod.fetch_by_redirect(page=page)
+            self.assertEqual(r.status, update_mod.UP_TO_DATE)
+
+            # 没有跳转 -> 不是成功态
+            Handler.tag = "none"
+            r = update_mod.fetch_by_redirect(page=page)
+            self.assertEqual(r.status, update_mod.NOT_FOUND)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+            urlreq.install_opener(urlreq.build_opener())
+
+    def test_fetch_does_not_fall_back_for_custom_url(self):
+        """传了 url 就是本地假接口，403 不能再顺手套一次真网络。"""
+        import http.server
+        import threading
+        import urllib.request as urlreq
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(403)
+                self.end_headers()
+                self.wfile.write(b'{"message":"rate limited"}')
+
+            def log_message(self, *args):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port = srv.server_address[1]
+        th = threading.Thread(target=srv.serve_forever)
+        th.daemon = True
+        th.start()
+        saved = {}
+        for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+            saved[k] = os.environ.pop(k, None)
+        urlreq.install_opener(urlreq.build_opener(urlreq.ProxyHandler({})))
+        try:
+            r = update_mod.fetch(url="http://127.0.0.1:%d/x" % port)
+            self.assertEqual(r.status, update_mod.FORBIDDEN)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+            urlreq.install_opener(urlreq.build_opener())
+
     def test_gui_wiring(self):
         """静态检查 gui.py 里该接的线还在。"""
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
