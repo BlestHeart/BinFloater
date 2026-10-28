@@ -1193,6 +1193,7 @@ class TestUpdate(unittest.TestCase):
 
     def test_check_async_calls_back(self):
         import threading
+        import urllib.request as urlreq
         got = []
         done = threading.Event()
 
@@ -1200,12 +1201,28 @@ class TestUpdate(unittest.TestCase):
             got.append(result)
             done.set()
 
-        th = update_mod.check_async(cb, url="http://127.0.0.1:1/x")
-        self.assertIsInstance(th, threading.Thread)
-        # 守护线程：关程序时不用等这次网络超时
-        self.assertTrue(th.daemon)
-        self.assertTrue(done.wait(30))
-        self.assertEqual(got[0].status, update_mod.NETWORK)
+        # 连一个必然没人监听的端口。跑之前先把代理环境变量摘掉：机器上配着
+        # http_proxy 时 urllib 会把 http://127.0.0.1:1/x 也丢给代理，拿回来
+        # 一个 HTTP 错误码，于是这里就变成 http_error 而不是 network——
+        # 测试想验证的是「连不上」，不是「代理回了个错」。
+        saved = {}
+        for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+                  "all_proxy", "ALL_PROXY"):
+            saved[k] = os.environ.pop(k, None)
+        urlreq.install_opener(urlreq.build_opener(urlreq.ProxyHandler({})))
+        try:
+            th = update_mod.check_async(cb, url="http://127.0.0.1:1/x")
+            self.assertIsInstance(th, threading.Thread)
+            # 守护线程：关程序时不用等这次网络超时
+            self.assertTrue(th.daemon)
+            self.assertTrue(done.wait(30))
+            self.assertEqual(got[0].status, update_mod.NETWORK,
+                             got[0].message)
+        finally:
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+            urlreq.install_opener(urlreq.build_opener())
 
     def test_fetch_by_redirect_against_local_server(self):
         """API 被限流时的备用查询：读 releases/latest 的 Location 头。"""
