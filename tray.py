@@ -185,7 +185,7 @@ class TrayIcon:
     调用方必须只做入队，不能碰 tkinter。
     """
 
-    def __init__(self, on_event, tooltip="二进制悬浮窗"):
+    def __init__(self, on_event, tooltip="编码悬浮窗"):
         self.on_event = on_event
         self.tooltip = tooltip[:127]
         self._hwnd = None

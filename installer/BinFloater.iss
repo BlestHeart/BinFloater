@@ -14,7 +14,7 @@
 ; 新版本安装包双击后走的是「升级」分支，先关掉正在跑的进程再覆盖文件，
 ; 用户不用先手动卸载。改 AppId 会导致新旧版本同时装着。
 
-#define AppName "二进制悬浮窗"
+#define AppName "编码悬浮窗"
 #define AppExe "BinFloater.exe"
 #define AppVersion GetEnv("BINF_VERSION")
 #if AppVersion == ""
@@ -189,6 +189,24 @@ begin
   end;
 end;
 
+{ 老版本在开始菜单里叫「二进制悬浮窗」。改名前装过的用户升级上来，
+  新名字会建一个新文件夹，旧文件夹和里面的快捷方式留在原地 —— 还能用，
+  但同一个软件在开始菜单里出现两份，看着像没卸干净。
+
+  所以装的时候顺手把旧名字的文件夹删掉。AppId 没变，安装目录也没变
+  （DefaultDirName 里写死的是 BinFloater，不是 AppName），删掉的只是快捷方式。
+  PrivilegesRequired=lowest 装的是当前用户的开始菜单，所以路径取 userprograms。 }
+procedure CleanOldShortcuts();
+var
+  OldDir: String;
+begin
+  OldDir := ExpandConstant('{userprograms}\二进制悬浮窗');
+  if DirExists(OldDir) then
+    DelTree(OldDir, True, True, True);
+  DeleteFile(ExpandConstant('{autodesktop}\二进制悬浮窗.lnk'));
+  DeleteFile(ExpandConstant('{userstartup}\二进制悬浮窗.lnk'));
+end;
+
 { 升级前先优雅关掉正在运行的实例。
 
   为什么不在 [Files] 里靠 CloseApplications：那个机制是给 install 阶段用的，
@@ -203,6 +221,7 @@ begin
        ewWaitUntilTerminated, ResultCode);
   { 给它一点时间把 config.json 写完 }
   Sleep(300);
+  CleanOldShortcuts();
   Result := '';
 end;
 

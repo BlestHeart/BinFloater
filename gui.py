@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""BIN 二进制悬浮窗 —— 无边框、置顶、可拖动。
+"""BinFloater 编码悬浮窗 —— 无边框、置顶、可拖动。
 
 功能：
-  1. 监视剪切板，检测到 0/1 字符串自动翻译成文字；
-  2. 内置输入框，把输入的文字实时转成二进制并可一键复制。
+  1. 监视剪切板，认得出二进制 / 十六进制 / Base64 / 摩斯码，自动翻成文字；
+  2. 内置输入框，把输入的文字实时转成上面任意一种格式并可一键复制；
+  3. 在任意程序里把光标所在那一段就地转换完粘回去。
 """
 import json
 import os
@@ -816,7 +817,7 @@ class BinFloater:
         dot.pack(side="left", padx=(2, 8))
         self.dot = dot
 
-        title = tk.Label(head, text="二进制悬浮窗", bg=BG, fg=TEXT, font=self.font_title)
+        title = tk.Label(head, text="编码悬浮窗", bg=BG, fg=TEXT, font=self.font_title)
         title.pack(side="left")
         self.title_lbl = title
         title.bind("<Button-1>", self._drag_start)
@@ -1757,7 +1758,7 @@ class BinFloater:
             self.status.pack(fill="x", padx=16, pady=(0, 8))
             self.root.geometry(f"{self.width}x{self.height}")
             self.collapse_btn.configure(text="▲")
-            self.title_lbl.configure(text="二进制悬浮窗")
+            self.title_lbl.configure(text="编码悬浮窗")
         if persist:
             # 记住折叠状态：用户习惯折起来只露一条，每次启动都展开很烦
             self.cfg["collapsed"] = collapsed
@@ -1770,7 +1771,7 @@ class BinFloater:
     def _paint_collapsed_title(self):
         """折叠时标题栏显示「最后一条状态」，不展开也能知道发生了什么。
 
-        之前只显示译文，没有译文时就只剩四个字「二进制悬浮窗」，等于
+        之前只显示译文，没有译文时就只剩「编码悬浮窗」几个字，等于
         折叠状态下什么都看不到 —— 快捷键有没有生效、刚转了什么全不知道。
         """
         parts = []
@@ -1790,7 +1791,7 @@ class BinFloater:
                 tip = tip[:18] + "…"
             parts.append(tip)
         if not parts:
-            parts.append("二进制悬浮窗")
+            parts.append("编码悬浮窗")
         self.title_lbl.configure(text=" · ".join(parts))
 
     def _cycle_alpha(self):
@@ -2336,8 +2337,8 @@ class BinFloater:
             trig = self._trigger_text()
             self._tray = tray.TrayIcon(
                 self._on_tray_event,
-                tooltip=(("二进制悬浮窗 · %s" % trig) if trig
-                         else "二进制悬浮窗 · 触发已关闭"),
+                tooltip=(("编码悬浮窗 · %s" % trig) if trig
+                         else "编码悬浮窗 · 触发已关闭"),
             )
             self._tray.start()
         except Exception:
@@ -2458,8 +2459,8 @@ class BinFloater:
             return
         try:
             trig = self._trigger_text()
-            text = (("二进制悬浮窗 · %s" % trig) if trig
-                    else "二进制悬浮窗 · 触发已关闭")[:127]
+            text = (("编码悬浮窗 · %s" % trig) if trig
+                    else "编码悬浮窗 · 触发已关闭")[:127]
             self._tray.set_tooltip(text)
         except Exception:
             pass
@@ -2729,7 +2730,7 @@ class BinFloater:
         self.result.set_text(PLACEHOLDER_RESULT)
         self.clip_badge.configure(text="等待 0/1 串", fg=MUTED)
         if self._collapsed:
-            self.title_lbl.configure(text="二进制悬浮窗")
+            self.title_lbl.configure(text="编码悬浮窗")
 
     def _clip_to_bin(self):
         text = self._last_clip

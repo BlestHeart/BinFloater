@@ -50,6 +50,13 @@ bash build_installer.sh --no-build   # 只重新生成安装包，用现有 dist
   会把它藏起来，但恰恰是升级时用户最可能想把安装位置改掉。
 - `[InstallDelete]` 先清 `_internal`：onedir 升级时旧版本会留下已经不存在的模块
   文件，不清的话可能导入到旧的 `.pyd/.pyc`。
+- `AppName` 是显示名，**改它不会动安装目录**（`DefaultDirName` 里写死的是
+  `BinFloater` 而不是 `{#AppName}`），所以 1.7.2 从「二进制悬浮窗」改名成
+  「编码悬浮窗」时，老用户升级后配置和文件都还在原地。
+  但开始菜单里会多出一个新名字的文件夹、旧的那份留在原处，看着像没卸干净 ——
+  所以 `[Code]` 里加了个 `CleanOldShortcuts()`，在 `PrepareToInstall` 里
+  把旧名字的开始菜单文件夹、桌面快捷方式和开机启动项删掉。
+  `PrivilegesRequired=lowest` 装的是当前用户的开始菜单，所以路径用 `{userprograms}`。
 
 `tests/install_check.py` 会真装一遍（静默）、启动、发 WM_CLOSE 优雅退出、再静默卸载，
 核对默认位置确实不在 C 盘、配置确实写到了安装目录而不是 `%APPDATA%`。
