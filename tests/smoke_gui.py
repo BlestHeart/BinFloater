@@ -495,54 +495,53 @@ check("长文本已经转换到结果区",
 check("长文本有提示", "没放进输入框" in app.status.cget("text"),
       app.status.cget("text"))
 
-# ---------- 输入卡片的方向切换 ----------
+# ---------- 输入卡片的模式切换 ----------
 print()
-print("== 输入方向 ==")
-# 以前这张卡片只会往编码方向走，想解一段编码只能先复制进剪切板。
-app.dir_rev = False
+print("== 输入模式 ==")
+# 普通模式：只按「文字 -> 编码」走。
+# 自动识别模式：方向由内容决定，格式按钮决定「认出是文字之后编成哪一种」。
+app.auto_mode = False
 app._paint_manual_dir()
 app.fmt = "binary"
 app.input_var.set("Hi")
-check("正向：结果是编码", app.bin_out.get("1.0", "end-1c").startswith("01001000"),
+check("普通：结果是编码", app.bin_out.get("1.0", "end-1c").startswith("01001000"),
       app.bin_out.get("1.0", "end-1c")[:20])
-check("正向：标题是文字到编码", app.manual_title.cget("text") == "文字 → 编码",
+check("普通：标题是文字到编码", app.manual_title.cget("text") == "文字 → 编码",
       app.manual_title.cget("text"))
-check("正向：按钮写复制编码", app.copy_btn.cget("text") == "复制编码",
+check("普通：按钮写复制编码", app.copy_btn.cget("text") == "复制编码",
       app.copy_btn.cget("text"))
 
-app._toggle_dir()          # 切到反向，会自动重算一次
-check("反向：方向标记翻转", app.dir_rev is True, app.dir_rev)
-check("反向：标题是编码到文字", app.manual_title.cget("text") == "编码 → 文字",
+app._toggle_dir()          # 切到自动识别，会自动重算一次
+check("自动：模式标记翻转", app.auto_mode is True, app.auto_mode)
+check("自动：标题是自动识别", app.manual_title.cget("text") == "自动识别",
       app.manual_title.cget("text"))
-check("反向：按钮写复制文字", app.copy_btn.cget("text") == "复制文字",
+check("自动：按钮写复制结果", app.copy_btn.cget("text") == "复制结果",
       app.copy_btn.cget("text"))
 
 app.input_var.set("01001000 01101001")   # 触发 trace -> _on_input
-check("反向：二进制能解成文字", app.bin_out.get("1.0", "end-1c").strip() == "Hi",
+check("自动：粘编码自动解成文字", app.bin_out.get("1.0", "end-1c").strip() == "Hi",
       app.bin_out.get("1.0", "end-1c"))
-
-# 选错格式时应当自己认出这是二进制。这里必须挑一个「明确解不开」的格式：
-# hex 和 base64 都会把 "01001000 01101001" 解成一堆字节（它确实同时是合法的
-# 十六进制和 Base64），根本走不到兜底那条路。摩斯码解不了数字串，用它才触发。
-app.fmt = "morse"
-app.input_var.set("01001000 01101001")
-check("反向：格式选错也能自动认出", app.bin_out.get("1.0", "end-1c").strip() == "Hi",
-      app.bin_out.get("1.0", "end-1c"))
-check("反向：提示里说明了自动识别",
+check("自动：解编码时提示认出了格式",
       "自动认出" in app.len_badge.cget("text"), app.len_badge.cget("text"))
 
-app.fmt = "binary"
-app.input_var.set("这不是编码")
-check("反向：解不开时不乱写结果", app.bin_out.get("1.0", "end-1c").strip() == "",
+# 格式按钮选错也照样解得出：认格式走 detect_format，不看按钮。
+app.fmt = "morse"
+app.input_var.set("01001000 01101001")
+check("自动：格式选错也能解出来", app.bin_out.get("1.0", "end-1c").strip() == "Hi",
       app.bin_out.get("1.0", "end-1c"))
-check("反向：解不开时角标提示", app.len_badge.cget("text") == "解不开",
-      app.len_badge.cget("text"))
 
-app._toggle_dir()          # 切回正向
+# 认出是文字时，按格式按钮当前选的那种编——这证明格式按钮在自动模式下仍然有用。
+app.fmt = "hex"
 app.input_var.set("Hi")
-check("切回正向：恢复编码", app.bin_out.get("1.0", "end-1c").startswith("01001000"),
+check("自动：普通文字按选中格式编码", app.bin_out.get("1.0", "end-1c").strip() == "48 69",
+      app.bin_out.get("1.0", "end-1c"))
+app.fmt = "binary"
+
+app._toggle_dir()          # 切回普通模式
+app.input_var.set("Hi")
+check("切回普通：恢复编码", app.bin_out.get("1.0", "end-1c").startswith("01001000"),
       app.bin_out.get("1.0", "end-1c")[:20])
-check("切回正向：标题复原", app.manual_title.cget("text") == "文字 → 编码",
+check("切回普通：标题复原", app.manual_title.cget("text") == "文字 → 编码",
       app.manual_title.cget("text"))
 app.input_var.set("")
 

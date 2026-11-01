@@ -435,7 +435,9 @@ class BinFloater:
             self.sep = "space"
         # 下方输入卡片的方向：False = 文字->编码，True = 编码->文字。
         # 不写进配置：这是临时用法，下次打开还是从「文字->编码」开始更符合直觉。
-        self.dir_rev = False
+        # False = 普通模式，只按「文字 → 编码」走；
+        # True  = 自动识别模式，由内容自己决定方向。点标题右边的 ⇄ 切。
+        self.auto_mode = False
         # 钩子回调在系统线程里跑，绝对不能直接碰 tkinter（会崩）。
         # 回调只往队列里塞一个事件，主线程用 after 轮询取。
         self._triggers = queue.Queue()
@@ -1691,7 +1693,9 @@ class BinFloater:
         self.dir_mode = DIR_AUTO
         self.fmt = "binary"
         self.sep = "space"
-        self.dir_rev = False
+        # False = 普通模式，只按「文字 → 编码」走；
+        # True  = 自动识别模式，由内容自己决定方向。点标题右边的 ⇄ 切。
+        self.auto_mode = False
         self._clip_paused = False
         self.topmost = True
         self.cfg["trigger_mode"] = self.trigger_mode
@@ -2803,7 +2807,20 @@ class BinFloater:
             self.bin_out.set_text("")
             self.len_badge.configure(text="")
             return
-        if self.dir_rev:
+        if self.auto_mode:
+            self._auto_input(text)
+            return
+        out = core.encode_as(text, self.fmt, self.sep)
+        self.bin_out.set_text(out)
+        self.len_badge.configure(text=core.describe(text))
+
+    def _auto_input(self, text):
+        """自动识别模式：内容像编码就解成文字，否则照格式按钮编成编码。
+
+        方向不看按钮、只看内容（core.auto_detect）。所以格式按钮在这里
+        仍然有用——它决定「认出是文字之后，编成哪一种」。
+        """
+        if core.auto_detect(text) == "bin2text":
             self._decode_input(text)
             return
         out = core.encode_as(text, self.fmt, self.sep)
@@ -2811,19 +2828,24 @@ class BinFloater:
         self.len_badge.configure(text=core.describe(text))
 
     def _decode_input(self, text):
-        """反向：把输入框里的编码解成文字。
+        """把输入框里的编码解成文字。
 
-        先按当前选的格式解；解不开就用 detect_format 自己认一次——用户手上
-        多是从别处粘来的一串，未必和下拉里选的格式一致，硬按选中的解只会报错。
+        先让 detect_format 自己认——用户手上多是从别处粘来的一串，未必和
+        格式按钮选的一致；认不出来才退回按选中的格式硬解一次。
         """
-        out, msg = core.decode_as(text, self.fmt)
-        if out is None:
-            guess = core.detect_format(text)
-            if guess and guess != self.fmt:
-                out2, msg2 = core.decode_as(text, guess)
-                if out2 is not None:
-                    out = out2
-                    msg = "%s · 自动认出是%s" % (msg2, core.FORMAT_TEXT.get(guess, guess))
+        out, msg = None, ""
+        guess = core.detect_format(text)
+        if guess:
+            out, msg = core.decode_as(text, guess)
+            if out is not None:
+                msg = "%s · 自动认出是%s" % (
+                    msg, core.FORMAT_TEXT.get(guess, guess))
+        if out is None and guess != self.fmt:
+            # 认出来的格式解不动（长度不对之类），再按按钮选的那位试一次
+            out, msg = core.decode_as(text, self.fmt)
+            if out is not None:
+                msg = "%s · 按选中的%s解出来的" % (
+                    msg, core.FORMAT_TEXT.get(self.fmt, self.fmt))
         if out is None:
             self.bin_out.set_text("")
             self.len_badge.configure(text="解不开")
@@ -2832,21 +2854,24 @@ class BinFloater:
         self.len_badge.configure(text=msg or "")
 
     def _toggle_dir(self):
-        """在「文字 → 编码」和「编码 → 文字」之间来回切。
+        """⇄：在「文字 → 编码」和「自动识别」之间来回切。
+
+        自动识别模式里方向由内容决定，格式按钮仍然管「编成哪一种」。
 
         注意别和上面那个 _paint_dir_btn 搞混：那个是「转换当前行」的
-        自动/文字→二进制/二进制→文字，这个是下方输入卡片的进出方向。
+        自动/文字→二进制/二进制→文字，这个是下方输入卡片的模式。
         """
-        self.dir_rev = not self.dir_rev
+        self.auto_mode = not self.auto_mode
         self._paint_manual_dir()
         self._on_input()
 
     def _paint_manual_dir(self):
-        """方向按钮的颜色、卡片标题、复制按钮文案都跟着方向走。"""
-        if self.dir_rev:
-            self.manual_title.configure(text="编码 → 文字")
+        """按钮颜色、卡片标题、复制按钮文案都跟着模式走。"""
+        if self.auto_mode:
+            self.manual_title.configure(text="自动识别")
             self.dir_btn.configure(fg=TEAL)
-            self.copy_btn.configure(text="复制文字")
+            # 自动识别时结果可能是文字也可能是编码，别写死「复制编码」
+            self.copy_btn.configure(text="复制结果")
         else:
             self.manual_title.configure(text="文字 → 编码")
             self.dir_btn.configure(fg=ACCENT)
