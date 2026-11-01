@@ -1714,5 +1714,53 @@ class TestPerf(unittest.TestCase):
             self.assertEqual(dec, text)
 
 
+
+
+class TestInstallerScript(unittest.TestCase):
+    """备用安装脚本（不依赖 Inno Setup 的那份）的静态检查。
+
+    为什么要有它：Inno 做的安装器在部分机器上根本起不来，报
+    「无法创建目录 ...\Temp\is-XXXX.tmp，错误 5」。那条路必须先往临时目录
+    释放安装引擎，被安全软件挡住就没救了。install.ps1 不释放任何可执行文件，
+    只复制文件 + 建快捷方式，所以它必须一直可用。
+    """
+
+    def setUp(self):
+        self.root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.ps1 = os.path.join(self.root, "installer", "install.ps1")
+        self.bat = os.path.join(self.root, "installer", "安装.bat")
+
+    def test_files_exist(self):
+        self.assertTrue(os.path.isfile(self.ps1), "installer/install.ps1 不存在")
+        self.assertTrue(os.path.isfile(self.bat), "installer/安装.bat 不存在")
+
+    def test_no_local_paths(self):
+        with open(self.ps1, "r", encoding="utf-8-sig") as fh:
+            src = fh.read()
+        for bad in ["C:\\Users\\", "Administrator", "G:\\DeepSeek"]:
+            self.assertNotIn(bad, src, "安装脚本里不该出现本机路径：%s" % bad)
+
+    def test_default_dir_is_not_c_drive(self):
+        with open(self.ps1, "r", encoding="utf-8-sig") as fh:
+            src = fh.read()
+        # 默认位置要先试 D/E/F，只有都没有才退回用户目录
+        self.assertIn('"D", "E", "F"', src)
+        self.assertIn("Programs", src)
+        self.assertIn("FolderBrowserDialog", src)
+
+    def test_uninstall_uses_detached_delete(self):
+        with open(self.ps1, "r", encoding="utf-8-sig") as fh:
+            src = fh.read()
+        # 删自己住的目录不能同步做（cmd 的当前目录锁着它），必须 start 出去再删
+        self.assertIn('start "" /min', src)
+        self.assertIn("reg delete", src)
+        self.assertIn("HKCU", src)
+
+    def test_version_falls_back_to_version_txt(self):
+        with open(self.ps1, "r", encoding="utf-8-sig") as fh:
+            src = fh.read()
+        # PyInstaller 打包后没有 version.py，脚本要靠 version.txt 取版本号
+        self.assertIn("version.txt", src)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

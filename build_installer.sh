@@ -71,6 +71,15 @@ if [ ! -f "dist/BinFloater/BinFloater.exe" ]; then
   exit 1
 fi
 
+# 把「不依赖安装器框架」的安装脚本一起放进 dist，压缩包里就能直接用。
+# 同时写一个 version.txt：PyInstaller 打包后没有 version.py，脚本靠它取版本号。
+# 必须先写 BOM 再拼内容：Windows PowerShell 5.1 读没有 BOM 的 UTF-8 脚本时
+# 会按系统代码页（936）解析，里面的中文直接变成乱码，连引号都会配错。
+printf '\xEF\xBB\xBF' > dist/BinFloater/install.ps1
+cat installer/install.ps1 >> dist/BinFloater/install.ps1
+cp installer/安装.bat dist/BinFloater/安装.bat
+printf '%s\n' "$VERSION" > dist/BinFloater/version.txt
+
 echo "== 2/2 生成安装包 =="
 # BINF_VERSION 通过环境变量传给 .iss 里的 GetEnv，版本号只在这里定义一次
 BINF_VERSION="$VERSION" "$ISCC" "installer/BinFloater.iss"

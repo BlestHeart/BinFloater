@@ -58,6 +58,47 @@ bash build_installer.sh --no-build   # 只重新生成安装包，用现有 dist
   把旧名字的开始菜单文件夹、桌面快捷方式和开机启动项删掉。
   `PrivilegesRequired=lowest` 装的是当前用户的开始菜单，所以路径用 `{userprograms}`。
 
+
+## 备用安装脚本（installer/install.ps1 + 安装.bat）
+
+有人反馈双击安装包直接弹「安装程序无法创建目录 …\Temp\is-XXXX.tmp，错误 5：拒绝访问」。
+查下来不是我们的包的问题：**连一个只含 1 个文件的最小 Inno 安装器在这台机器上也起不来**，
+换 `%TEMP%` 位置（C 盘别处、G 盘）、`UseSetupLdr=no`、改目录完整性级别全试过，
+只有偶然一次走通。Inno 的加载器必须先把自己的引擎释放到临时目录再执行，
+这一步被安全软件挡住就没有任何配置能绕（Inno 也没有 `TempDir` 指令）。
+
+所以额外提供一份**不依赖任何安装器框架**的脚本，压缩包里一起发：
+
+- `installer/install.ps1`：复制文件 → 建开始菜单/桌面快捷方式 → 写
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\BinFloater` 卸载项 →
+  生成同目录的 `卸载.bat`。**不释放任何可执行文件**，所以整条被挡的链路都不经过。
+  只写 HKCU 和用户目录，不需要管理员。
+- `installer/安装.bat`：`chcp 65001` + `powershell -ExecutionPolicy Bypass -File install.ps1`。
+
+写这两份东西时必须记住的坑：
+
+- **`.ps1` 必须带 UTF-8 BOM**。Windows PowerShell 5.1 读没有 BOM 的 UTF-8 脚本会按
+  系统代码页（936）解码，中文全变乱码，连引号都会配错，报
+  `Unexpected token 'BinFloater"`。`build_installer.sh` 里是
+  `printf '\xEF\xBB\xBF' > 目标` 再 `cat` 源文件，不靠源文件自带 BOM
+  （编辑器/补丁工具会把它吃掉）。
+- **`.bat` 必须 CRLF 换行**。纯 LF 会让 cmd 把每行开头几个字符吞掉，
+  典型症状是 `'65001' 不是内部或外部命令`（`chcp` 被吃掉）。
+- **卸载不能同步删自己所在的目录**。cmd 的当前目录锁着它，`Remove-Item` 必失败。
+  做法是先 `reg delete` + 删快捷方式，再
+  `start "" /min powershell -WindowStyle Hidden -Command "Start-Sleep -Milliseconds 600; Remove-Item …"`
+  把删除甩到后台进程，bat 立刻退出，锁自然释放。
+  也别用 `cd /d "%TEMP%"` 绕：某些环境下 `%TEMP%` 是空的，反而报「找不到指定的路径」。
+- **`reg delete` 的路径必须以根键开头**（`HKCU\Software\…`）。只写 `Software\…`
+  会报「系统找不到指定的路径」，很容易误以为是权限问题。
+- **版本号来源**：PyInstaller 打包后没有 `version.py`，所以 `build_installer.sh` 会往
+  `dist/BinFloater/version.txt` 写一行版本号，脚本按
+  `-Version 参数 → version.txt → version.py` 的顺序取。
+
+`tests/test_all.py` 里的 `TestInstallerScript` 用静态检查兜底：文件在不在、
+里面不能出现本机路径、默认目录要先试 D/E/F、卸载必须是 detached 删除、
+版本号必须能从 `version.txt` 取。
+
 `tests/install_check.py` 会真装一遍（静默）、启动、发 WM_CLOSE 优雅退出、再静默卸载，
 核对默认位置确实不在 C 盘、配置确实写到了安装目录而不是 `%APPDATA%`。
 它需要先 `bash build_installer.sh` 出安装包。
@@ -83,7 +124,7 @@ bash build_installer.sh --no-build   # 只重新生成安装包，用现有 dist
 ## 测试
 
 ```bash
-python tests/test_all.py       # 159 项：编解码四种格式 + 格式识别 + 性能优化等价性 + 触发逻辑 + 快捷键解析 + 版本号 + 检查更新 + 应用内下载 + 源码约定
+python tests/test_all.py       # 164 项：编解码四种格式 + 格式识别 + 性能优化等价性 + 触发逻辑 + 快捷键解析 + 版本号 + 检查更新 + 应用内下载 + 备用安装脚本 + 源码约定
 python tests/test_config.py    #  64 项：配置原子写盘、坏文件备份、类型校验、错误日志、配置目录选择、安装脚本
 python tests/smoke_gui.py      # 200 项：真建窗口，控件、钩子、托盘、历史、滑块、录制回显、长文本保护、检查更新、应用内下载、自动检查开关可见性
 python tests/e2e_convert.py    #  23 项：真 Win32 窗口，真按键、真粘贴、选区边界
