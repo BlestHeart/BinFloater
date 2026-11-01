@@ -1531,14 +1531,23 @@ class BinFloater:
             msg = "%s → %s" % (result.current, result.latest)
             if line:
                 msg += "\n" + line
+            # 走的是镜像线路就顺带说一句：用户看到「国内镜像」才知道
+            # 不挂梯子也能用，不然下次换台机器又以为是坏了
+            how = ""
+            if result.source and result.source != update_mod.SOURCE_GITHUB:
+                how = "（走的国内镜像）"
             self._set_status(
-                "有新版本 %s，点「去下载」" % result.latest, TEAL, 12000)
+                "有新版本 %s%s，点「去下载」" % (result.latest, how), TEAL, 12000)
             # 收在托盘里的时候窗口看不见，必须用气泡声告知一声
             self._notify_tray("发现新版本 %s" % result.latest, msg)
             return
 
         if result.status == update_mod.UP_TO_DATE:
-            self._set_status("已是最新版本（v%s）" % version.VERSION, TEAL, 5000)
+            how = ""
+            if result.source and result.source != update_mod.SOURCE_GITHUB:
+                how = "（走的国内镜像）"
+            self._set_status(
+                "已是最新版本（v%s）%s" % (version.VERSION, how), TEAL, 5000)
         elif result.status == update_mod.NOT_FOUND:
             # 仓库还是私有的，匿名请求拿不到任何东西。别把它说成「网络故障」
             self._set_status(

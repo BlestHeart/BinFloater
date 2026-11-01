@@ -12,7 +12,7 @@
 语义化版本：主版本.次版本.修订号，和 git tag `v{ VERSION }` 保持一致。
 """
 
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 
 # 程序显示名。installer 里也用它，保持一致。
 DISPLAY_NAME = "编码悬浮窗"

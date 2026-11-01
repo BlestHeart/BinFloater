@@ -83,9 +83,9 @@ bash build_installer.sh --no-build   # 只重新生成安装包，用现有 dist
 ## 测试
 
 ```bash
-python tests/test_all.py       # 151 项：编解码四种格式 + 格式识别 + 性能优化等价性 + 触发逻辑 + 快捷键解析 + 版本号 + 检查更新 + 应用内下载 + 源码约定
+python tests/test_all.py       # 159 项：编解码四种格式 + 格式识别 + 性能优化等价性 + 触发逻辑 + 快捷键解析 + 版本号 + 检查更新 + 应用内下载 + 源码约定
 python tests/test_config.py    #  64 项：配置原子写盘、坏文件备份、类型校验、错误日志、配置目录选择、安装脚本
-python tests/smoke_gui.py      # 198 项：真建窗口，控件、钩子、托盘、历史、滑块、录制回显、长文本保护、检查更新、应用内下载、自动检查开关可见性
+python tests/smoke_gui.py      # 200 项：真建窗口，控件、钩子、托盘、历史、滑块、录制回显、长文本保护、检查更新、应用内下载、自动检查开关可见性
 python tests/e2e_convert.py    #  23 项：真 Win32 窗口，真按键、真粘贴、选区边界
 python tests/e2e_notepad.py    #   9 项：开真记事本，验证剪切板还原
 python tests/e2e_roundtrip.py  #  18 项：文字 → 二进制 → 文字 往返（含超长会换行的）
@@ -250,6 +250,32 @@ pystray 不支持气泡通知（`NIF_INFO`），而「收进托盘时告诉用�
 私有仓库的匿名请求会得到 404（GitHub 不区分「不存在」和「没权限」），所以 404
 单独归成 `NOT_FOUND`，界面上写「仓库还没公开」而不是「网络故障」——后者会让人
 去查防火墙，方向全错。
+
+### 国内网络：四条线路并发
+
+直连 `api.github.com` 在国内实测是 **8 秒超时**，也就是只有一条线路的话国内用户
+永远查不到更新。所以 `fetch_any` 同时向四条线路发请求，**谁先给出 `OK` /
+`UP_TO_DATE` 就用谁**（403/404/超时只说明这条不行，继续等别的）。全是守护线程，
+总等待 `timeout + 2` 秒封顶，全失败时返回第一个失败结果好让提示里的原因是真实的。
+
+| 线路 | 常量 | 拿到什么 |
+|---|---|---|
+| 官方接口 | `SOURCE_GITHUB` | 完整 Release JSON |
+| `gh-proxy.com` 前缀转发 | `SOURCE_MIRROR` | 与官方一字不差的 JSON（实测 0.8 秒） |
+| jsDelivr 包信息 | `SOURCE_JSDELIVR` | 只有版本号列表，够判断有没有新版 |
+| 网页跳转兜底 | `SOURCE_REDIRECT` | 从 `Location` 头抠 tag |
+
+为什么不串行试：四条各 8 秒就是半分钟，用户点一下按钮干等着。并发之后能用的那条
+通常 1 秒内返回。`UpdateInfo.source` 记着结果来自哪条线路，界面上只在不是官方
+直连时提一句，方便排查。
+
+**试过但不通的别再捡回来**：`ghproxy.net` / `ghfast.top` / `gh.llkk.cc` /
+`api.kkgithub.com` / `hub.gitmirror.com` 全部超时或 DNS 失败；
+`cdn.jsdelivr.net` 连接被重置（用 `data.jsdelivr.com` 那个 API 域名）。
+
+下载侧同样有镜像兜底：`_download_urls` 先给原地址，再逐个套 `MIRROR_PREFIXES`
+前缀，全试完才报错。**安全性不靠线路，靠 sha256**——Release 里公布的 digest 校验
+不过就删掉 `.part` 返回 `DL_BAD_HASH`，所以多跳一层代理不会放大风险。
 
 下载侧四个必做的事：
 

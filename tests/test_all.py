@@ -1114,6 +1114,101 @@ class TestUpdate(unittest.TestCase):
         self.assertIn("BinFloater/", update_mod.USER_AGENT)
         self.assertIn(version_mod.VERSION, update_mod.USER_AGENT)
 
+    def test_mirror_constants(self):
+        # 国内直连 GitHub 是不通的（实测 8 秒超时），所以必须有镜像线路
+        self.assertTrue(update_mod.MIRROR_PREFIXES)
+        self.assertEqual(update_mod.MIRROR_API,
+                         update_mod.MIRROR_PREFIXES[0] + update_mod.API_LATEST)
+        self.assertIn(update_mod.REPO, update_mod.JSDELIVR_PKG)
+        self.assertEqual(
+            len({update_mod.SOURCE_GITHUB, update_mod.SOURCE_MIRROR,
+                 update_mod.SOURCE_JSDELIVR, update_mod.SOURCE_REDIRECT}), 4)
+
+    def test_parse_jsdelivr_newer(self):
+        # jsDelivr 的 version 字段不带 v 前缀
+        r = update_mod.parse_jsdelivr({"versions": [
+            {"version": "1.7.0"}, {"version": "1.8.0"}, {"version": "1.6.9"},
+        ]})
+        self.assertEqual(r.status, update_mod.OK)
+        self.assertEqual(r.latest, "1.8.0")
+        self.assertEqual(r.source, update_mod.SOURCE_JSDELIVR)
+        self.assertIn("/releases/tag/v1.8.0", r.html_url)
+        # 版本号是不带 v 前缀的，拼链接时要自己补
+        self.assertNotIn("tag/vv", r.html_url)
+
+    def test_parse_jsdelivr_up_to_date(self):
+        r = update_mod.parse_jsdelivr(
+            {"versions": [{"version": version_mod.VERSION}]})
+        self.assertEqual(r.status, update_mod.UP_TO_DATE)
+        self.assertFalse(r.has_update)
+
+    def test_parse_jsdelivr_bad_payloads(self):
+        for payload in ([], "x", 5, {}, {"versions": []},
+                        {"versions": [{"version": ""}, "junk", 7]}):
+            r = update_mod.parse_jsdelivr(payload)
+            self.assertEqual(r.status, update_mod.BAD_JSON, repr(payload))
+
+    def test_download_urls_order(self):
+        # 先直连，不通再套镜像
+        urls = list(update_mod._download_urls(
+            "https://github.com/x/y/releases/download/v1/a.exe"))
+        self.assertEqual(urls[0],
+                         "https://github.com/x/y/releases/download/v1/a.exe")
+        self.assertEqual(len(urls), 1 + len(update_mod.MIRROR_PREFIXES))
+        self.assertEqual(urls[1], update_mod.MIRROR_PREFIXES[0] + urls[0])
+        # 已经是镜像地址的不要重复套前缀
+        again = list(update_mod._download_urls(urls[1]))
+        self.assertEqual(again, [urls[1]])
+        # 不是 GitHub 的地址不套镜像：镜像站转发的是 github.com 的路径，
+        # 套到别的域名上只会白等一次超时，还会把错误原因盖掉
+        local = "http://127.0.0.1:8080/pkg.exe"
+        self.assertEqual(list(update_mod._download_urls(local)), [local])
+
+    def test_fetch_any_takes_first_success(self):
+        """四条线路是并发的：慢的那条不能拖住快的那条。"""
+        import time as _time
+
+        def slow(cur, t):
+            _time.sleep(0.6)
+            return update_mod.UpdateInfo(update_mod.NETWORK, "慢的失败了",
+                                         current=cur)
+
+        def fast(cur, t):
+            return update_mod.UpdateInfo(update_mod.OK, "有新版", latest="v9.9.9",
+                                         current=cur)
+
+        began = _time.time()
+        r = update_mod.fetch_any(sources=[("slow", slow), ("fast", fast)])
+        elapsed = _time.time() - began
+        self.assertEqual(r.status, update_mod.OK)
+        self.assertEqual(r.latest, "v9.9.9")
+        # 并发的话 0.2 秒内就回来了；串行要等满 0.6 秒
+        self.assertLess(elapsed, 0.5, "看起来是串行跑的，耗时 %.2fs" % elapsed)
+
+    def test_fetch_any_reports_failure(self):
+        def bad(cur, t):
+            return update_mod.UpdateInfo(update_mod.NETWORK, "连不上", current=cur)
+
+        r = update_mod.fetch_any(sources=[("a", bad)])
+        self.assertEqual(r.status, update_mod.NETWORK)
+
+        def boom(cur, t):
+            raise RuntimeError("炸了")
+
+        r = update_mod.fetch_any(sources=[("boom", boom)])
+        self.assertEqual(r.status, update_mod.NETWORK)
+
+        self.assertEqual(update_mod.fetch_any(sources=[]).status,
+                         update_mod.NETWORK)
+
+    def test_check_async_uses_fetch_any(self):
+        # 正常路径必须走多线路，不然国内用户永远查不到
+        import inspect
+        src = inspect.getsource(update_mod.check_async)
+        self.assertIn("fetch_any", src)
+        # 传了 url（测试用假接口）时不能顺手打真网络
+        self.assertIn("url is None", src)
+
     def test_fetch_against_local_server(self):
         """本地假接口跑一遍，覆盖 200 / 404 / 403 / 500 / 非 JSON / 连不上。"""
         import http.server

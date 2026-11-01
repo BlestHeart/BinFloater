@@ -584,6 +584,15 @@ check("已是最新时文字", "已是最新" in app._update_lbl.cget("text"),
 check("已是最新时按钮回到检查更新",
       app._update_btn.cget("text") == "检查更新", app._update_btn.cget("text"))
 
+# 走国内镜像查到的结果：界面要照常显示版本号，状态栏要说明线路
+app._on_update_result(update_mod.UpdateInfo(
+    update_mod.OK, "发现新版本 v9.9.9（走的国内镜像）", latest="v9.9.9",
+    current=version_mod.VERSION, source=update_mod.SOURCE_MIRROR))
+check("镜像查到新版也显示版本号", "v9.9.9" in app._update_lbl.cget("text"),
+      app._update_lbl.cget("text"))
+check("镜像线路在状态栏里有交代", "镜像" in app.status.cget("text"),
+      app.status.cget("text"))
+
 # 仓库没公开（404）：别说成「网络故障」，要直说读不到
 app._on_update_result(update_mod.UpdateInfo(
     update_mod.NOT_FOUND, "仓库还没公开，读不到发布信息"))

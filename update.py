@@ -23,7 +23,9 @@
 import hashlib
 import json
 import os
+import queue
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -32,6 +34,29 @@ import version
 REPO = "BlestHeart/BinFloater"
 API_LATEST = "https://api.github.com/repos/%s/releases/latest" % REPO
 RELEASES_PAGE = "https://github.com/%s/releases/latest" % REPO
+
+# ---- 国内网络：直连 GitHub 是不通的 ----
+#
+# 实测（不挂任何代理）：github.com 和 api.github.com 都是 8 秒超时，
+# 也就是「检查更新」在国内用户的机器上永远失败。所以除了官方接口，
+# 再挂几条不需要账号的公共线路：
+#
+#   gh-proxy.com      把 api.github.com 原样转发过来，返回的 JSON 一字不差，
+#                     附件、sha256 摘要、更新说明全都有。实测 0.8 秒。
+#   data.jsdelivr.com 只给版本号列表（它把 git tag 当版本），没有附件和说明，
+#                     但判断「有没有新版」够了。实测 1.3 秒。
+#
+# 下面这些试过但不通，别再捡回来：ghproxy.net / ghfast.top / gh.llkk.cc /
+# api.kkgithub.com / hub.gitmirror.com（全部 8 秒超时或 DNS 解析失败）。
+MIRROR_PREFIXES = ("https://gh-proxy.com/",)
+MIRROR_API = MIRROR_PREFIXES[0] + API_LATEST
+JSDELIVR_PKG = "https://data.jsdelivr.com/v1/packages/gh/%s" % REPO
+
+# 结果是从哪条线路拿到的，出错时方便定位
+SOURCE_GITHUB = "github"
+SOURCE_MIRROR = "mirror"
+SOURCE_JSDELIVR = "jsdelivr"
+SOURCE_REDIRECT = "redirect"
 
 # GitHub API 不带 User-Agent 会直接 403，这是硬要求不是礼貌
 USER_AGENT = "BinFloater/%s (+%s)" % (version.VERSION, RELEASES_PAGE)
@@ -124,10 +149,11 @@ class UpdateInfo(object):
     """检查结果。字段全给了默认值，调用方不用挨个判 None。"""
 
     __slots__ = ("status", "latest", "current", "name", "body",
-                 "html_url", "published_at", "message", "assets")
+                 "html_url", "published_at", "message", "assets", "source")
 
     def __init__(self, status, message="", latest="", current=None,
-                 name="", body="", html_url="", published_at="", assets=None):
+                 name="", body="", html_url="", published_at="", assets=None,
+                 source=""):
         self.status = status
         self.message = message
         self.latest = latest
@@ -137,6 +163,8 @@ class UpdateInfo(object):
         self.html_url = html_url or RELEASES_PAGE
         self.published_at = published_at
         self.assets = list(assets or [])
+        # 走的是哪条线路。界面上只在不是官方直连时提一句，方便排查。
+        self.source = source
 
     def asset(self, kind):
         """按类型挑附件。挑不到返回 None。"""
@@ -245,6 +273,58 @@ def parse_release(payload, current=None):
     )
 
 
+def parse_jsdelivr(payload, current=None):
+    """jsDelivr 的包信息转成 UpdateInfo。
+
+    它只给版本号列表（把 git tag 当版本），没有更新说明也没有附件清单。
+    作为兜底线路够用：能判断「有没有新版」，拿到版本号之后让用户自己去
+    Releases 页下载——反正走这条线路时也下载不了安装包。
+    """
+    current = current or version.VERSION
+    if not isinstance(payload, dict):
+        return UpdateInfo(BAD_JSON, "镜像返回的内容看不懂", current=current,
+                          source=SOURCE_JSDELIVR)
+
+    best = ""
+    for item in (payload.get("versions") or []):
+        if not isinstance(item, dict):
+            continue
+        tag = str(item.get("version") or "").strip()
+        if not tag:
+            continue
+        if not best or version.version_tuple(tag) > version.version_tuple(best):
+            best = tag
+
+    if not best:
+        return UpdateInfo(BAD_JSON, "镜像里没有版本号", current=current,
+                          source=SOURCE_JSDELIVR)
+
+    page = "https://github.com/%s/releases/tag/%s" % (
+        REPO, best if best.startswith("v") else "v" + best)
+    if version.is_newer(best, current):
+        return UpdateInfo(OK, "发现新版本 %s（走的国内镜像）" % best,
+                          latest=best, current=current, name=best,
+                          html_url=page, source=SOURCE_JSDELIVR)
+    return UpdateInfo(UP_TO_DATE, "已经是最新版本（走的国内镜像）",
+                      latest=best, current=current, html_url=page,
+                      source=SOURCE_JSDELIVR)
+
+
+# 只有 GitHub 自己的下载地址才值得套镜像：镜像站转发的是 github.com 的路径，
+# 套到别的域名上毫无意义（还会把「本机假接口」的测试拖去打真网络）。
+GITHUB_HOSTS = ("https://github.com/", "https://objects.githubusercontent.com/")
+
+
+def _download_urls(url):
+    """下载地址的候选顺序：先原地址，再逐个套镜像前缀。"""
+    yield url
+    if not url.startswith(GITHUB_HOSTS):
+        return
+    for prefix in MIRROR_PREFIXES:
+        if not url.startswith(prefix):
+            yield prefix + url
+
+
 def download_asset(asset, folder, progress=None, should_stop=None):
     """把附件下载到 folder，返回 DownloadResult。
 
@@ -273,20 +353,28 @@ def download_asset(asset, folder, progress=None, should_stop=None):
     final = os.path.join(folder, safe)
     part = final + ".part"
 
-    req = urllib.request.Request(asset.url, method="GET")
-    req.add_header("User-Agent", USER_AGENT)
-    req.add_header("Accept", "application/octet-stream")
-
     hasher = hashlib.sha256()
     written = 0
     total = asset.size
-    try:
-        resp = urllib.request.urlopen(req, timeout=READ_TIMEOUT_S)
-    except urllib.error.HTTPError as exc:
-        return DownloadResult(DL_HTTP, message="下载地址返回 HTTP %d" % (
-            int(getattr(exc, "code", 0) or 0),))
-    except Exception as exc:
-        return DownloadResult(DL_NETWORK, message="连不上下载地址：%r" % (exc,))
+
+    # 先直连，不通再套镜像。下载的完整性靠下面的 sha256 兜底，
+    # 所以中间多跳一层代理不会让「下到坏包」的风险变大。
+    resp = None
+    last_err = DownloadResult(DL_NETWORK, message="没有可用的下载地址")
+    for url in _download_urls(asset.url):
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("User-Agent", USER_AGENT)
+        req.add_header("Accept", "application/octet-stream")
+        try:
+            resp = urllib.request.urlopen(req, timeout=READ_TIMEOUT_S)
+            break
+        except urllib.error.HTTPError as exc:
+            last_err = DownloadResult(DL_HTTP, message="下载地址返回 HTTP %d" % (
+                int(getattr(exc, "code", 0) or 0),))
+        except Exception as exc:
+            last_err = DownloadResult(DL_NETWORK, message="连不上下载地址：%r" % (exc,))
+    if resp is None:
+        return last_err
 
     try:
         try:
@@ -549,6 +637,100 @@ def fetch_by_redirect(current=None, timeout=None, page=None):
     return UpdateInfo(HTTP_ERROR, "没有拿到跳转地址", current=current)
 
 
+def _fetch_jsdelivr(current=None, timeout=None):
+    """问 jsDelivr 要版本号列表。它走的是自己的 CDN，国内能连上。"""
+    current = current or version.VERSION
+    if timeout is None:
+        timeout = READ_TIMEOUT_S
+    req = urllib.request.Request(JSDELIVR_PKG, method="GET")
+    req.add_header("User-Agent", USER_AGENT)
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        try:
+            raw = _read_body(resp)
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+    except Exception as exc:
+        return UpdateInfo(NETWORK, "镜像连不上：%r" % (exc,), current=current,
+                          source=SOURCE_JSDELIVR)
+    try:
+        payload = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError as exc:
+        return UpdateInfo(BAD_JSON, "镜像返回的不是 JSON：%s" % (exc,),
+                          current=current, source=SOURCE_JSDELIVR)
+    return parse_jsdelivr(payload, current)
+
+
+def _default_sources():
+    """默认线路，按「正常情况下谁最快」排，实际是同时发、谁先回用谁。"""
+    return [
+        (SOURCE_GITHUB, lambda cur, t: fetch(cur, None, t)),
+        (SOURCE_MIRROR, lambda cur, t: fetch(cur, MIRROR_API, t)),
+        (SOURCE_JSDELIVR, lambda cur, t: _fetch_jsdelivr(cur, t)),
+        (SOURCE_REDIRECT, lambda cur, t: fetch_by_redirect(cur, t)),
+    ]
+
+
+def fetch_any(current=None, timeout=None, sources=None):
+    """同时问所有线路，谁先给出确定答案就用谁。
+
+    为什么不一条一条试：国内直连 api.github.com 是 8 秒超时，串行试完
+    四条线路要十几秒，用户点一下「检查更新」就干等着。并发发出去之后，
+    能用的那条通常 1 秒内就回来了，剩下的线程到点自己结束（都是守护线程）。
+
+    判定标准是「拿到了确定的答案」——OK 或 UP_TO_DATE。403/404/超时这些
+    都只算这条线路不行，继续等别的线路。全都失败时返回第一个失败结果，
+    这样提示里的原因至少是真实的。
+    """
+    current = current or version.VERSION
+    srcs = list(sources) if sources is not None else _default_sources()
+    if not srcs:
+        return UpdateInfo(NETWORK, "没有可用的线路", current=current)
+
+    if timeout is None:
+        timeout = READ_TIMEOUT_S
+    # 总时长给足：最慢的线路自己会在 timeout 秒后放弃
+    deadline = time.time() + timeout + 2.0
+
+    results = queue.Queue()
+
+    def run(name, fn):
+        try:
+            res = fn(current, timeout)
+        except Exception as exc:
+            res = UpdateInfo(NETWORK, "这条线路出错了：%r" % (exc,), current=current)
+        if res is not None and not res.source:
+            res.source = name
+        results.put((name, res))
+
+    for name, fn in srcs:
+        th = threading.Thread(target=run, args=(name, fn),
+                              name="BinFloaterUpdate-%s" % name)
+        th.daemon = True
+        th.start()
+
+    first_bad = None
+    for _ in range(len(srcs)):
+        remain = deadline - time.time()
+        if remain <= 0:
+            break
+        try:
+            name, res = results.get(timeout=remain)
+        except queue.Empty:
+            break
+        if res is not None and res.status in (OK, UP_TO_DATE):
+            return res
+        if first_bad is None:
+            first_bad = res
+
+    if first_bad is not None:
+        return first_bad
+    return UpdateInfo(NETWORK, "连不上 GitHub，也连不上国内镜像", current=current)
+
+
 def check_async(callback, current=None, url=None):
     """在后台线程里查一次，查完在后台线程回调 callback(UpdateInfo)。
 
@@ -561,7 +743,12 @@ def check_async(callback, current=None, url=None):
 
     def run():
         try:
-            result = fetch(current=current, url=url)
+            if url is None:
+                # 正常路径：四条线路并发，谁先回用谁（国内直连不通，见模块顶部）
+                result = fetch_any(current=current)
+            else:
+                # 传了 url 是测试用的本地假接口，只问这一条，别顺手打真网络
+                result = fetch(current=current, url=url)
         except Exception as exc:  # fetch 内部已兜底，这里是最后一道
             result = UpdateInfo(NETWORK, "检查更新时出错：%r" % (exc,), current=current)
         try:
