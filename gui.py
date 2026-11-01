@@ -433,6 +433,9 @@ class BinFloater:
         self.sep = self.cfg.get("separator", "space")
         if self.sep not in core.SEPARATORS:
             self.sep = "space"
+        # 下方输入卡片的方向：False = 文字->编码，True = 编码->文字。
+        # 不写进配置：这是临时用法，下次打开还是从「文字->编码」开始更符合直觉。
+        self.dir_rev = False
         # 钩子回调在系统线程里跑，绝对不能直接碰 tkinter（会崩）。
         # 回调只往队列里塞一个事件，主线程用 after 轮询取。
         self._triggers = queue.Queue()
@@ -915,10 +918,20 @@ class BinFloater:
         card = self._card(parent, pady=(0, 8))
         top = tk.Frame(card, bg=CARD)
         top.pack(fill="x", padx=12, pady=(10, 6))
-        tk.Label(top, text="文字 → 编码", bg=CARD, fg=TEXT,
-                 font=self.font_title).pack(side="left")
+        self.manual_title = tk.Label(top, text="文字 → 编码", bg=CARD, fg=TEXT,
+                                     font=self.font_title)
+        self.manual_title.pack(side="left")
         self.len_badge = tk.Label(top, text="", bg=CARD, fg=MUTED, font=self.font_meta)
         self.len_badge.pack(side="right")
+        # 方向切换。输入框以前只会往编码方向走，想解一段编码只能先复制进剪切板，
+        # 所以这里给一个就地反过来用的开关。
+        self.dir_btn = tk.Label(top, text="⇄", bg=CARD_HI, fg=ACCENT,
+                                font=self.font_meta, padx=7, pady=1,
+                                cursor="hand2")
+        self.dir_btn.pack(side="right", padx=(0, 8))
+        self.dir_btn.bind("<Button-1>", lambda e: self._toggle_dir())
+        self.dir_btn.bind("<Enter>", lambda e: self.dir_btn.configure(bg=STROKE))
+        self.dir_btn.bind("<Leave>", lambda e: self.dir_btn.configure(bg=CARD_HI))
 
         # 编码格式 + 分隔符行。放在标题下面单独一行：之前只有「紧凑」一个开关，
         # 想换个格式（十六进制/Base64/摩斯）根本没地方点。
@@ -995,6 +1008,8 @@ class BinFloater:
         self._btn(rows3, "解码为文件", self._decode_to_file).pack(side="left")
         tk.Label(rows3, text="把 0/1 串还原成字节存盘",
                  bg=CARD, fg="#5b6579", font=self.font_meta).pack(side="right")
+        # 放在最后调：_paint_manual_dir 要改 copy_btn 的文案，那按钮上面才建出来
+        self._paint_manual_dir()
 
     def _build_convert_card(self, parent):
         card = self._card(parent, pady=(0, 8))
@@ -1676,6 +1691,7 @@ class BinFloater:
         self.dir_mode = DIR_AUTO
         self.fmt = "binary"
         self.sep = "space"
+        self.dir_rev = False
         self._clip_paused = False
         self.topmost = True
         self.cfg["trigger_mode"] = self.trigger_mode
@@ -1708,6 +1724,7 @@ class BinFloater:
         self._paint_dir_btn()
         self._paint_format_btn()
         self._paint_separator_btn()
+        self._paint_manual_dir()
         self._paint_pause_btn()
         self._paint_auto_btn()
         self._paint_auto_update_btn()
@@ -2786,14 +2803,59 @@ class BinFloater:
             self.bin_out.set_text("")
             self.len_badge.configure(text="")
             return
+        if self.dir_rev:
+            self._decode_input(text)
+            return
         out = core.encode_as(text, self.fmt, self.sep)
         self.bin_out.set_text(out)
         self.len_badge.configure(text=core.describe(text))
 
+    def _decode_input(self, text):
+        """反向：把输入框里的编码解成文字。
+
+        先按当前选的格式解；解不开就用 detect_format 自己认一次——用户手上
+        多是从别处粘来的一串，未必和下拉里选的格式一致，硬按选中的解只会报错。
+        """
+        out, msg = core.decode_as(text, self.fmt)
+        if out is None:
+            guess = core.detect_format(text)
+            if guess and guess != self.fmt:
+                out2, msg2 = core.decode_as(text, guess)
+                if out2 is not None:
+                    out = out2
+                    msg = "%s · 自动认出是%s" % (msg2, core.FORMAT_TEXT.get(guess, guess))
+        if out is None:
+            self.bin_out.set_text("")
+            self.len_badge.configure(text="解不开")
+            return
+        self.bin_out.set_text(out)
+        self.len_badge.configure(text=msg or "")
+
+    def _toggle_dir(self):
+        """在「文字 → 编码」和「编码 → 文字」之间来回切。
+
+        注意别和上面那个 _paint_dir_btn 搞混：那个是「转换当前行」的
+        自动/文字→二进制/二进制→文字，这个是下方输入卡片的进出方向。
+        """
+        self.dir_rev = not self.dir_rev
+        self._paint_manual_dir()
+        self._on_input()
+
+    def _paint_manual_dir(self):
+        """方向按钮的颜色、卡片标题、复制按钮文案都跟着方向走。"""
+        if self.dir_rev:
+            self.manual_title.configure(text="编码 → 文字")
+            self.dir_btn.configure(fg=TEAL)
+            self.copy_btn.configure(text="复制文字")
+        else:
+            self.manual_title.configure(text="文字 → 编码")
+            self.dir_btn.configure(fg=ACCENT)
+            self.copy_btn.configure(text="复制编码")
+
     def _copy_binary(self):
         bits = self.bin_out.get("1.0", "end-1c").strip()
         if not bits:
-            self._set_status("先输入文字", WARN)
+            self._set_status("先输入内容", WARN)
             return
         self._copy_any(bits)
 
