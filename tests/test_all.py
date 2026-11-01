@@ -212,12 +212,53 @@ class TestCodecs(unittest.TestCase):
         back, msg = core.decode_as(enc, "morse")
         self.assertEqual(back, "SOS HI", "摩斯往返失败 (%s)" % msg)
 
-    def test_morse_chinese_becomes_placeholder(self):
-        # 中文没有摩斯码，编成 ? 占位，解码回到 ?，用户能看出丢了哪个字
-        enc = core.encode_as("你好Hi", "morse")
+    def test_morse_chinese_uses_telegraph_code(self):
+        """中文走中文电码：一个汉字 = 4 位数字，4 位数字转点划拼成一个词。
+
+        历史上中文电报就是这套四位电码，好处是能原样解回汉字，
+        而不是像早先那样整句丢成 ?。
+        """
+        enc = core.text_to_morse("你好")
+        tokens = enc.split()
+        self.assertEqual(len(tokens), 2, enc)
+        for tok in tokens:
+            self.assertEqual(len(tok), 20, "一个汉字应当正好 20 个符号: %s" % tok)
+        self.assertEqual(core.morse_to_text(enc)[0], "你好")
+        self.assertEqual(core.detect_format(enc), "morse")
+
+    def test_morse_chinese_roundtrip(self):
+        for txt in ("你好", "中国", "你好 世界", "编码悬浮窗"):
+            enc = core.encode_as(txt, "morse")
+            got, msg = core.decode_as(enc, "morse")
+            self.assertEqual(got, txt, "%s 摩斯往返失败: %r -> %r (%s)"
+                             % (txt, enc, got, msg))
+        # 中英混排：英文按码表转大写，中文原样回来
+        enc = core.encode_as("hi你好", "morse")
+        self.assertEqual(core.decode_as(enc, "morse")[0], "HI你好")
+
+    def test_morse_chinese_not_confused_with_digits(self):
+        """纯数字不能被误认成一个汉字：4 位数字是 4 个分开的词（各 5 符号）。
+
+        汉字电码是「20 个符号连成一个词」，而这个长度在标准摩斯里不存在
+        （字母最多 4 符号、数字正好 5），所以两者不会撞车。
+        """
+        enc = core.text_to_morse("2024")
+        self.assertEqual(len(enc.split()), 4, enc)
+        self.assertEqual(core.morse_to_text(enc)[0], "2024")
+
+    def test_morse_unknown_char_is_placeholder(self):
+        """两边码表都没有的字符（emoji、表外生僻字）才退化成 ? 占位。"""
+        enc = core.text_to_morse("a\U0001F642")
         self.assertIn("?", enc)
-        back, _msg = core.decode_as(enc, "morse")
-        self.assertEqual(back, "??HI")
+        self.assertEqual(core.morse_to_text(enc)[0], "A?")
+
+    def test_ccc_table_sane(self):
+        import ccc
+        self.assertGreater(ccc.size(), 6000, "电码表太小")
+        self.assertEqual(ccc.code("你"), "0132")
+        self.assertEqual(ccc.hanzi("0132"), "你")
+        self.assertEqual(ccc.code("A"), "")
+        self.assertEqual(ccc.hanzi("9999"), "")
 
     def test_morse_accepts_unicode_dots_and_dashes(self):
         # 用户可能用「·」和「—」手打摩斯码
@@ -320,8 +361,7 @@ class TestCodecs(unittest.TestCase):
 
         摩斯码只测大写：国际码表没有小写字母码，`text_to_morse` 会先转大写，
         所以 `Hi` 进、`HI` 出——这是码表本身的限制，不是 bug。
-        摩斯也不测中文：码表里没有中文码，只能编成 ? 占位，
-        那条路径由 `test_morse_chinese_placeholder_roundtrip` 单独覆盖。
+        中文那条路径由 `test_morse_chinese_roundtrip` 单独覆盖。
         """
         for fmt in core.FORMATS:
             seps = core.SEPARATORS if fmt == "binary" else ("space",)
@@ -335,21 +375,18 @@ class TestCodecs(unittest.TestCase):
                     got = core.decode_as(enc, fmt)[0]
                     self.assertEqual(got, txt, "%s/%s 往返失败" % (fmt, sep))
 
-    def test_morse_chinese_placeholder_roundtrip(self):
-        """中文编成摩斯是 ? 占位，但这个结果必须还能被认出是摩斯码。
+    def test_morse_placeholder_roundtrip(self):
+        """整段都是 ? 占位的摩斯串必须还能被认出是摩斯码。
 
-        「你好」→ `? ?`，一个点划都没有。早先 looks_like_morse 只数点划，
-        这种串认不出来，用户转过去就再也转不回来了。
-        连单个汉字都要能回来：「你」→ `?` 也认。
+        emoji 这类两边码表都没有的字符会编成 ?，一整句可能一个点划都没有。
+        早先 looks_like_morse 只数点划，这种串认不出来，用户转过去就再也转不回来。
         """
-        enc = core.text_to_morse("你好")
+        enc = core.text_to_morse("\U0001F642\U0001F600")
         self.assertEqual(enc, "? ?")
         self.assertEqual(core.detect_format(enc), "morse")
         got, msg = core.morse_to_text(enc)
         self.assertEqual(got, "??")
         self.assertIn("码表里没有", msg)
-        # 单个汉字也不能漏
-        self.assertEqual(core.text_to_morse("你"), "?")
         self.assertEqual(core.detect_format("?"), "morse")
         self.assertEqual(core.decode_as("?", "morse")[0], "?")
 

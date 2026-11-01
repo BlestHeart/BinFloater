@@ -110,6 +110,7 @@ bash build_installer.sh --no-build   # 只重新生成安装包，用现有 dist
 | `main.py` | 入口：单实例互斥体、命令行直转、`--version` |
 | `gui.py` | 悬浮窗界面（tkinter）、配置读写 |
 | `core.py` | 编解码逻辑，纯函数、无副作用 |
+| `ccc.py` | 中文电码表（7078 字），摩斯码承载中文用；生成脚本见文件头注释 |
 | `clipwin.py` | Win32 剪切板读写与变化监听（ctypes） |
 | `keys.py` | 模拟键盘：选中 / 复制 / 粘贴（SendInput） |
 | `trigger.py` | 全局键盘钩子（WH_KEYBOARD_LL） |
@@ -124,7 +125,7 @@ bash build_installer.sh --no-build   # 只重新生成安装包，用现有 dist
 ## 测试
 
 ```bash
-python tests/test_all.py       # 164 项：编解码四种格式 + 格式识别 + 性能优化等价性 + 触发逻辑 + 快捷键解析 + 版本号 + 检查更新 + 应用内下载 + 备用安装脚本 + 源码约定
+python tests/test_all.py       # 168 项：编解码四种格式 + 格式识别 + 性能优化等价性 + 触发逻辑 + 快捷键解析 + 版本号 + 检查更新 + 应用内下载 + 备用安装脚本 + 源码约定
 python tests/test_config.py    #  64 项：配置原子写盘、坏文件备份、类型校验、错误日志、配置目录选择、安装脚本
 python tests/smoke_gui.py      # 200 项：真建窗口，控件、钩子、托盘、历史、滑块、录制回显、长文本保护、检查更新、应用内下载、自动检查开关可见性
 python tests/e2e_convert.py    #  23 项：真 Win32 窗口，真按键、真粘贴、选区边界

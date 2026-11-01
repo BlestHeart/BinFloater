@@ -10,6 +10,8 @@ import binascii
 import re
 from typing import Optional, Tuple
 
+import ccc
+
 # 可识别的二进制文本形态：
 #   01001000 01101001 / 0100100001101001 / 0b01001000_0b01101001 / 0100-1000 ...
 _BIN_CHARS = set("01")
@@ -460,7 +462,7 @@ def looks_like_morse(text: str, min_len: int = 3) -> bool:
         return False
     if not set(body) <= {".", "-", "/", " ", "\t", "\n", "?"}:
         return False
-    # ? 也算内容：中文这类码表里没有的字符整句都编成 ?（「你好」→「? ?」），
+    # ? 也算内容：两边码表都没有的字符编成 ?（emoji 之类），
     # 一个点划都没有。只数点划的话这种串会被判成「不像摩斯码」，
     # 用户转过去就再也转不回来了。
     marks = body.count(".") + body.count("-")
@@ -483,12 +485,46 @@ def looks_like_morse(text: str, min_len: int = 3) -> bool:
     return True
 
 
+# 一个汉字的电码占多少符号：4 个数字 x 每个数字 5 个点划。
+# 这个长度很关键：国际码表里最长的码（标点）也就 6 个符号，字母 1~4、
+# 数字正好 5，所以「20 个符号连成一个词」在标准摩斯里根本不会出现，
+# 拿来当汉字电码的标记不会和任何正常内容撞车。
+_CCC_SYMBOLS = 20
+
+
+def _hanzi_to_morse_token(han: str) -> Optional[str]:
+    """汉字 -> 一个 20 符号的词（4 位电码里边每位数字转成点划再连写）。"""
+    code = ccc.code(han)
+    if not code:
+        return None
+    return "".join(_MORSE_TABLE[d] for d in code)
+
+
+def _morse_token_to_hanzi(token: str) -> Optional[str]:
+    """20 符号的词 -> 汉字。不是 4 位数字连写、或者查不到电码就返回 None。"""
+    if len(token) != _CCC_SYMBOLS:
+        return None
+    digits = []
+    for i in range(0, _CCC_SYMBOLS, 5):
+        ch = _MORSE_REVERSE.get(token[i:i + 5])
+        if ch is None or not ch.isdigit():
+            return None
+        digits.append(ch)
+    text = "".join(digits)
+    # 查不到就退回原样的 4 位数字，至少信息没丢
+    return ccc.hanzi(text) or text
+
+
 def text_to_morse(text: str) -> str:
     """文本 -> 摩斯码。字母之间空格，单词之间 /。
 
-    摩斯的国际码表只覆盖拉丁字母、数字和少量标点，中文完全没有对应码。
-    这类字符统一编成 ?（国际惯例的「无法表示」占位）：解码时原样回到 ?，
-    用户一眼能看出哪几个字没转过去，而不是看到一个静默丢字的串。
+    中文走「中文电码」：一个汉字一个 4 位数字（历史上中文电报就是这套），
+    4 个数字连成一个词发出去，解的时候再拼回数字查表。这样中文既真的能
+    按摩斯发，也能原样解回汉字。
+
+    两边码表都没有的字符（emoji、日文等等）还是编成 ?（国际惯例的
+    「无法表示」占位），解码时回到 ?，用户一眼能看出哪几个字没转过去，
+    而不是看到一个静默丢字的串。
     """
     if text == "":
         return ""
@@ -500,7 +536,12 @@ def text_to_morse(text: str) -> str:
         letters = []
         for ch in word:
             code = _MORSE_TABLE.get(ch)
-            letters.append(code if code is not None else "?")
+            if code is not None:
+                letters.append(code)
+                continue
+            # 中文按电码走，一个汉字编成一个 20 符号的词
+            token = _hanzi_to_morse_token(ch)
+            letters.append(token if token is not None else "?")
         out.append(" ".join(letters))
     return " / ".join(out)
 
@@ -524,16 +565,21 @@ def morse_to_text(text: str) -> Tuple[Optional[str], str]:
         letters = []
         for code in word.split():
             if code == "?":
-                # 这是我们自己的占位符（码表里没有的字符，比如中文）
+                # 这是我们自己的占位符（两边码表都没有的字符，比如 emoji）
                 holes += 1
                 letters.append("?")
                 continue
             ch = _MORSE_REVERSE.get(code)
-            if ch is None:
-                unknown += 1
-                letters.append("?")
-            else:
+            if ch is not None:
                 letters.append(ch)
+                continue
+            # 20 个符号连成一个词 = 汉字电码，先按这个解
+            han = _morse_token_to_hanzi(code)
+            if han is not None:
+                letters.append(han)
+                continue
+            unknown += 1
+            letters.append("?")
         out_words.append("".join(letters))
     result = " ".join(out_words)
     # 只有占位符也算解码成功：「你好」整句编成 `? ?`，一个点划都没有，
@@ -548,7 +594,7 @@ def morse_to_text(text: str) -> Tuple[Optional[str], str]:
     if unknown:
         msg += f" · 有 {unknown} 组码表里没有，用 ? 占位"
     elif holes:
-        msg += f" · 有 {holes} 个字符码表里没有（中文等），用 ? 占位"
+        msg += f" · 有 {holes} 个字符码表里没有（emoji、其他文字），用 ? 占位"
     return result, msg
 
 
